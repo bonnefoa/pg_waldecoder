@@ -1,10 +1,12 @@
-use std::{
-    ffi::{c_void, CString},
-    path,
-};
+mod lsn_utils;
+mod wal_utils;
+
+use std::ffi::{c_void, CString};
 use thiserror::Error;
 
 use pgrx::{pg_sys::InvalidXLogRecPtr, prelude::*};
+
+use crate::lsn_utils::lsn_to_rec_ptr;
 
 ::pgrx::pg_module_magic!(name, version);
 
@@ -18,81 +20,19 @@ pub enum InvalidLSN {
     InvalidHexValue(String, String),
 }
 
-fn lsn_to_startptr(lsn: Option<&str>) -> Result<u64, InvalidLSN> {
-    let lsn = match lsn {
-        Some(lsn) => lsn,
-        None => return Err(InvalidLSN::NoLSN),
-    };
-
-    let mut iter = lsn.split("/");
-    let xlogid_str = iter.next().unwrap();
-    let xlogid = match u64::from_str_radix(xlogid_str, 16) {
-        Ok(xlogid) => xlogid,
-        Err(e) => return Err(InvalidLSN::InvalidHexValue(lsn.to_string(), e.to_string())),
-    };
-
-    let xrecoff_str = iter.next().unwrap();
-    let xrecoff = match u64::from_str_radix(xrecoff_str, 16) {
-        Ok(xrecoff) => xrecoff,
-        Err(e) => return Err(InvalidLSN::InvalidHexValue(lsn.to_string(), e.to_string())),
-    };
-    Ok(xlogid << 32 | xrecoff)
-}
-
-fn filename_to_startptr(filename: Option<&str>, wal_segsz_bytes: i32) -> Result<u64, InvalidLSN> {
-    let filename = match filename {
-        Some(filename) => filename,
-        None => return Err(InvalidLSN::NoLSN),
-    };
-    let filename = match path::Path::new(filename)
-        .file_name()
-        .and_then(|s| s.to_str())
-    {
-        Some(p) => p,
-        None => return Err(InvalidLSN::InvalidFileName),
-    };
-
-    // let _tli = match u64::from_str_radix(&filename[0..8], 16) {
-    //     Ok(tli) => tli,
-    //     Err(e) => {
-    //         return Err(InvalidLSN::InvalidHexValue(
-    //             filename[0..8].to_string(),
-    //             e.to_string(),
-    //         ))
-    //     }
-    // };
-
-    let log_str = &filename[8..16];
-    let log = match u64::from_str_radix(log_str, 16) {
-        Ok(log) => log,
-        Err(e) => {
-            return Err(InvalidLSN::InvalidHexValue(
-                log_str.to_string(),
-                e.to_string(),
-            ))
-        }
-    };
-
-    let seg_str = &filename[16..24];
-    let seg = match u64::from_str_radix(seg_str, 16) {
-        Ok(seg) => seg,
-        Err(e) => {
-            return Err(InvalidLSN::InvalidHexValue(
-                seg_str.to_string(),
-                e.to_string(),
-            ))
-        }
-    };
-    Ok(log * 0x100000000 * (wal_segsz_bytes as u64) + seg)
+struct XLogReaderPrivate {
+    timeline: u32,
+    start_ptr: u64,
+    end_ptr: u64,
+    endptr_reached: bool,
 }
 
 #[pg_extern]
 fn pg_waldecoder(
-    start_lsn: default!(Option<&str>, "NULL"),
-    _end_lsn: default!(Option<&str>, "NULL"),
+    start_lsn: default!(&str, "NULL"),
+    end_lsn: default!(&str, "NULL"),
+    timeline: default!(i32, 1),
     wal_dir: default!(Option<&str>, "NULL"),
-    wal_file: default!(Option<&str>, "NULL"),
-    wal_sg_size: default!(Option<i32>, 16777216),
 ) -> TableIterator<
     'static,
     (
@@ -105,9 +45,26 @@ fn pg_waldecoder(
         name!(row_after, &'static str),
     ),
 > {
-    info!("Called with: {start_lsn:?}, {_end_lsn:?}, {wal_dir:?}, {wal_file:?}, {wal_sg_size:?}");
-    let wal_sg_size = wal_sg_size.unwrap_or(16777216);
-    let private_data = Box::new(pg_sys::ReadLocalXLogPageNoWaitPrivate { end_of_wal: false });
+    info!("Called with: {start_lsn:?}, {end_lsn:?}, {timeline:?}, {wal_dir:?}");
+
+    // Parse arguments
+    let start_ptr = match lsn_to_rec_ptr(start_lsn) {
+        Ok(start_ptr) => start_ptr,
+        Err(e) => error!("Error: {}", e.to_string()),
+    };
+
+    //.or(filename_to_startptr(wal_file, wal_sg_size))
+    let end_ptr = match lsn_to_rec_ptr(end_lsn) {
+        Ok(end_ptr) => end_ptr,
+        Err(e) => error!("Error: {}", e.to_string()),
+    };
+
+    let private_data = Box::new(XLogReaderPrivate {
+        timeline: timeline.cast_unsigned(),
+        start_ptr,
+        end_ptr,
+        endptr_reached: false,
+    });
     let xl_routine = Box::new(pg_sys::XLogReaderRoutine {
         page_read: Some(pg_waldecoder_read_page),
         segment_open: None,
@@ -120,27 +77,21 @@ fn pg_waldecoder(
     };
     let xlog_reader = unsafe {
         pg_sys::XLogReaderAllocate(
-            wal_sg_size,
+            123,
             wal_dir_ptr,
             Box::into_raw(xl_routine),
-            Box::into_raw(private_data) as *mut c_void,
+            Box::into_raw(private_data).cast::<c_void>(),
         )
     };
 
-    let start_ptr = match lsn_to_startptr(start_lsn).or(filename_to_startptr(wal_file, wal_sg_size))
-    {
-        Ok(start_ptr) => start_ptr,
-        Err(e) => error!("Error: {}", e.to_string()),
-    };
-
     let first_record = unsafe { pg_sys::XLogFindNextRecord(xlog_reader, start_ptr) };
-    if first_record == (InvalidXLogRecPtr as u64) {
+    if first_record == u64::from(InvalidXLogRecPtr) {
         error!(
             "could not find a valid record after {:X}/{:X}",
             start_ptr >> 32,
-            start_ptr as u32
+            (start_ptr & 0xff00) as u32
         );
-    };
+    }
 
     let results = vec![(
         1,
@@ -163,7 +114,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_read_page(
     _target_ptr: pg_sys::XLogRecPtr,
     _read_buff: *mut i8,
 ) -> i32 {
-    0
+    todo!()
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -180,22 +131,8 @@ mod tests {
     #[pg_test]
     fn test_pg_waldecoder() {
         let wal_dir = test_case!("18_single_upgrade");
-        let wal_file = test_case!("000000010000000000000018");
-        let _res = crate::pg_waldecoder(None, None, Some(wal_dir), Some(wal_file), None);
-    }
-
-    #[test]
-    fn test_lsn_to_startptr() {
-        let res = crate::lsn_to_startptr(Some("0/01800C50"));
-        assert_eq!(res.unwrap(), 25168976);
-        let res = crate::lsn_to_startptr(Some("2/01800C50"));
-        assert_eq!(res.unwrap(), 8615103568);
-    }
-
-    #[test]
-    fn test_filename_to_startptr() {
-        let res = crate::filename_to_startptr(Some("000000010000000000000018"), 1048576);
-        assert_eq!(res.unwrap(), 24);
+        // let wal_file = test_case!("000000010000000000000018");
+        let _res = crate::pg_waldecoder("0/01800028", "0/01800D28", 1, Some(wal_dir));
     }
 }
 
