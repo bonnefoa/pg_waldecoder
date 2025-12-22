@@ -35,6 +35,7 @@ codegen-units = 1
 pedantic = { level = "deny", priority = -1 }
 unreadable_literal = "allow"
 cast_ptr_alignment = "allow"
+dead_code = "allow"
 # missing_errors_doc = "allow"
 # missing_panics_doc = "allow"
 # module_name_repetitions = "allow"

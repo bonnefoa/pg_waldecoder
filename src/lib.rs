@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 mod lsn_utils;
 mod wal_utils;
 
