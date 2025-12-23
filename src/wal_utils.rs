@@ -1,4 +1,4 @@
-use pgrx::pg_sys::{XLogLongPageHeaderData, XLOG_BLCKSZ};
+use pgrx::pg_sys::{XLOG_BLCKSZ, XLogLongPageHeaderData};
 use std::{
     fs::{self, File},
     io::{self, Read},
@@ -12,41 +12,40 @@ const WAL_SEG_MAX_SIZE: u32 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq, Error)]
 pub enum InvalidWalFile {
-    #[error("Could not locate director {0}")]
-    NoDir(String),
+    #[error("Io error: {0}")]
+    IoError(String),
     #[error("Invalid WAL file name {0}")]
     InvalidFileName(String),
     #[error("Could not read WAL file {0}: {1}")]
     ReadError(String, String),
-    #[error("Invalid segment size: {0}")]
-    InvalidSegSize(u32),
     #[error("WAL file {0} doesn't exist")]
     NoFile(String),
     #[error("Invalid WAL segment size {0}. The WAL segment size must be a power of two between 1MB and 1GB.")]
     InvalidWalSegSz(u32),
 }
 
+/// Search directory with valid WAL file.
 pub fn search_directory(dir: PathBuf) -> Result<Option<PathBuf>, io::Error> {
     let mut entries = fs::read_dir(dir)?
         .map(|res| res.map(|e| e.path()))
         .collect::<Result<Vec<_>, io::Error>>()?;
     entries.sort();
-
     for f in entries {
         if validate_wal_file(&f).is_err() {
             continue;
         }
         return Ok(Some(f));
     }
-
     Ok(None)
 }
 
+/// Returns true if WAL seg size is correct
 pub fn is_valid_wal_seg_size(wal_seg_size: u32) -> bool {
     wal_seg_size.is_power_of_two()
         && (WAL_SEG_MIN_SIZE..=WAL_SEG_MAX_SIZE).contains(&wal_seg_size)
 }
 
+/// Validate that the provided file is a valid WAL file
 pub fn validate_wal_file(wal_path: &PathBuf) -> Result<u32, InvalidWalFile> {
     let wal_str = wal_path.to_string_lossy().to_string();
     if !wal_path.exists() {
@@ -84,7 +83,7 @@ pub fn validate_wal_file(wal_path: &PathBuf) -> Result<u32, InvalidWalFile> {
     let s = unsafe { std::ptr::read(buffer.as_ptr().cast::<XLogLongPageHeaderData>()) };
 
     if !is_valid_wal_seg_size(s.xlp_seg_size) {
-        return Err(InvalidWalFile::InvalidSegSize(s.xlp_seg_size));
+        return Err(InvalidWalFile::InvalidWalSegSz(s.xlp_seg_size));
     }
 
     Ok(s.xlp_seg_size)

@@ -5,21 +5,11 @@ mod wal_utils;
 use std::ffi::{c_void, CString};
 use thiserror::Error;
 
-use pgrx::{pg_sys::InvalidXLogRecPtr, prelude::*};
+use pgrx::{pg_sys::{InvalidXLogRecPtr, XLOG_BLCKSZ}, prelude::*};
 
 use crate::lsn_utils::lsn_to_rec_ptr;
 
 ::pgrx::pg_module_magic!(name, version);
-
-#[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq, Error)]
-pub enum InvalidLSN {
-    #[error("No LSN provided")]
-    NoLSN,
-    #[error("Invalid filename")]
-    InvalidFileName,
-    #[error("Invalid hex value in '{0}': `{1}`")]
-    InvalidHexValue(String, String),
-}
 
 struct XLogReaderPrivate {
     timeline: u32,
@@ -29,8 +19,24 @@ struct XLogReaderPrivate {
 }
 
 #[pg_extern]
+fn pg_waldecoder_path(wal_path: &str) -> TableIterator<
+    'static,
+    (
+        name!(oid, i64),
+        name!(relid, i64),
+        name!(xid, pg_sys::TransactionId),
+        name!(redo_query, &'static str),
+        name!(revert_query, &'static str),
+        name!(row_before, &'static str),
+        name!(row_after, &'static str),
+    ),>
+{
+    todo!()
+}
+
+#[pg_extern]
 fn pg_waldecoder(
-    start_lsn: default!(&str, "NULL"),
+    start_lsn: &str,
     end_lsn: default!(&str, "NULL"),
     timeline: default!(i32, 1),
     wal_dir: default!(Option<&str>, "NULL"),
@@ -54,7 +60,6 @@ fn pg_waldecoder(
         Err(e) => error!("Error: {}", e.to_string()),
     };
 
-    //.or(filename_to_startptr(wal_file, wal_sg_size))
     let end_ptr = match lsn_to_rec_ptr(end_lsn) {
         Ok(end_ptr) => end_ptr,
         Err(e) => error!("Error: {}", e.to_string()),
@@ -109,12 +114,15 @@ fn pg_waldecoder(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn pg_waldecoder_read_page(
-    _state: *mut pg_sys::XLogReaderState,
-    _target_page_ptr: pg_sys::XLogRecPtr,
-    _req_len: i32,
-    _target_ptr: pg_sys::XLogRecPtr,
-    _read_buff: *mut i8,
+    state: *mut pg_sys::XLogReaderState,
+    target_page_ptr: pg_sys::XLogRecPtr,
+    req_len: i32,
+    target_ptr: pg_sys::XLogRecPtr,
+    read_buff: *mut i8,
 ) -> i32 {
+    let private = unsafe { PgBox::from_pg((*state).private_data) };
+    let count = XLOG_BLCKSZ;
+
     todo!()
 }
 
