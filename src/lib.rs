@@ -3,17 +3,11 @@ mod lsn_utils;
 mod wal_utils;
 
 use std::{
-    env,
-    ffi::{c_void, CStr, CString},
-    fs::File,
-    os::fd::AsRawFd,
-    path::Path,
+    env, ffi::{CStr, CString, c_void}, fs::File, io, os::fd::AsRawFd, path::Path
 };
 
 use pgrx::{
-    pg_sys::{
-        InvalidXLogRecPtr, TimeLineID, WALRead, WALReadError, XLogSegNo, XLOG_BLCKSZ,
-    },
+    pg_sys::{InvalidXLogRecPtr, TimeLineID, WALRead, WALReadError, XLogSegNo, XLOG_BLCKSZ},
     prelude::*,
 };
 
@@ -56,23 +50,24 @@ unsafe extern "C-unwind" fn pg_waldecoder_read_page(
         None => blcksz,
     };
 
-    let errinfo = WALReadError::default();
-    let e = Box::new(errinfo);
+    let errinfo = Box::into_raw(Box::new(WALReadError::default()));
     if !WALRead(
         state,
         read_buff,
         target_page_ptr,
         usize::try_from(count).unwrap(),
         private.timeline,
-        Box::into_raw(e),
+        errinfo,
     ) {
+        let errinfo = Box::from_raw(errinfo);
         let seg = errinfo.wre_seg;
         let fname = xlog_file_name(seg.ws_tli, seg.ws_segno, pg_state.segcxt.ws_segsize);
 
         if errinfo.wre_errno != 0 {
+            let error = io::Error::from_raw_os_error(errinfo.wre_errno);
             error!(
-                "could not read from file {0}, offset {1}",
-                fname, errinfo.wre_off
+                "could not read from file {0}, offset {1}: {2}",
+                fname, errinfo.wre_off, error
             );
         } else {
             error!(
@@ -94,11 +89,13 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
     let fname = xlog_file_name(*tli_ptr, next_seg_no, pg_state.segcxt.ws_segsize);
     let wal_dir = CStr::from_ptr(pg_state.segcxt.ws_dir.as_ptr())
         .to_str()
-        .expect("Valid wal_dir");
+        .expect("Error converting wal_dir to cstr");
+
     let path = Path::new(wal_dir).join(&fname);
-    let Ok(f) = File::open(path) else {
+    let Ok(f) = File::open(&path) else {
         error!("Could not open file \"{}\"", fname);
     };
+    info!("Opening segment {}", path.display());
     pg_state.seg.ws_file = f.as_raw_fd();
 }
 
@@ -170,10 +167,9 @@ fn pg_waldecoder(
         error!("No valid WAL files found in wal dir")
     };
 
-    let wal_dir_ptr = CString::new(wal_dir.to_str().expect("wal_dir conversion error"))
-        .expect("WAL dir cstring conversion failed")
-        .as_c_str()
-        .as_ptr();
+    let wal_dir_cstr = CString::new(wal_dir.to_str().expect("wal_dir conversion error"))
+        .expect("WAL dir cstring conversion failed");
+    let wal_dir_ptr = wal_dir_cstr.as_c_str().as_ptr();
 
     let xlog_reader = unsafe {
         pg_sys::XLogReaderAllocate(
