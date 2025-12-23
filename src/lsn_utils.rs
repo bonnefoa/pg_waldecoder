@@ -34,8 +34,8 @@ pub fn lsn_to_rec_ptr(lsn: &str) -> Result<u64, InvalidLSN> {
 }
 
 /// Returns file name for a provided timeline and record pointer
-pub fn xlog_file_name(tli: TimeLineID, log_seg_no: XLogSegNo, wal_segsz_bytes: u32) -> String {
-    let segments_per_xlog_id = 0x100000000u64 / u64::from(wal_segsz_bytes);
+pub fn xlog_file_name(tli: TimeLineID, log_seg_no: XLogSegNo, wal_segsz_bytes: i32) -> String {
+    let segments_per_xlog_id = 0x100000000u64 / u64::from(wal_segsz_bytes.cast_unsigned());
     let up = log_seg_no / segments_per_xlog_id;
     let rest = log_seg_no % segments_per_xlog_id;
     format!("{tli:08X}{up:08X}{rest:08X}")
