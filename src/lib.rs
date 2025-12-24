@@ -1,6 +1,7 @@
 #![allow(dead_code)]
-mod lsn_utils;
-mod wal_utils;
+mod lsn;
+mod wal;
+mod record;
 
 use std::{
     ffi::{CStr, CString, c_void}, fs::File, io, os::fd::AsRawFd, path::Path
@@ -12,8 +13,8 @@ use pgrx::{
 };
 
 use crate::{
-    lsn_utils::{lsn_to_rec_ptr, xlog_file_name},
-    wal_utils::detect_wal_dir,
+    lsn::{lsn_to_rec_ptr, xlog_file_name},
+    wal::detect_wal_dir,
 };
 
 ::pgrx::pg_module_magic!(name, version);
