@@ -3,7 +3,7 @@ mod lsn_utils;
 mod wal_utils;
 
 use std::{
-    env, ffi::{CStr, CString, c_void}, fs::File, io, os::fd::AsRawFd, path::Path
+    ffi::{CStr, CString, c_void}, fs::File, io, os::fd::AsRawFd, path::Path
 };
 
 use pgrx::{
@@ -23,6 +23,7 @@ struct XLogReaderPrivate {
     startptr: u64,
     endptr: Option<u64>,
     endptr_reached: bool,
+    opened_segment: Option<File>,
 }
 
 #[pg_guard]
@@ -86,6 +87,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
     tli_ptr: *mut TimeLineID,
 ) {
     let mut pg_state = unsafe { PgBox::from_pg(state) };
+    let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
     let fname = xlog_file_name(*tli_ptr, next_seg_no, pg_state.segcxt.ws_segsize);
     let wal_dir = CStr::from_ptr(pg_state.segcxt.ws_dir.as_ptr())
         .to_str()
@@ -97,6 +99,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
     };
     info!("Opening segment {}", path.display());
     pg_state.seg.ws_file = f.as_raw_fd();
+    private.opened_segment = Some(f);
 }
 
 // #[pg_extern]
@@ -155,6 +158,7 @@ fn pg_waldecoder(
         startptr,
         endptr,
         endptr_reached: false,
+        opened_segment: None,
     });
 
     let xl_routine = Box::new(pg_sys::XLogReaderRoutine {
