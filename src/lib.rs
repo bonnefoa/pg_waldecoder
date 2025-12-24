@@ -92,7 +92,6 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
     let wal_dir = CStr::from_ptr(pg_state.segcxt.ws_dir.as_ptr())
         .to_str()
         .expect("Error converting wal_dir to cstr");
-
     let path = Path::new(wal_dir).join(&fname);
     let Ok(f) = File::open(&path) else {
         error!("Could not open file \"{}\"", fname);
@@ -100,6 +99,14 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
     info!("Opening segment {}", path.display());
     pg_state.seg.ws_file = f.as_raw_fd();
     private.opened_segment = Some(f);
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn pg_waldecoder_segment_close(
+    state: *mut pg_sys::XLogReaderState,
+) {
+    let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
+    private.opened_segment = None;
 }
 
 // #[pg_extern]
@@ -164,7 +171,7 @@ fn pg_waldecoder(
     let xl_routine = Box::new(pg_sys::XLogReaderRoutine {
         page_read: Some(pg_waldecoder_read_page),
         segment_open: Some(pg_waldecoder_segment_open),
-        segment_close: None,
+        segment_close: Some(pg_waldecoder_segment_close),
     });
 
     let Some((wal_dir, segsz)) = detect_wal_dir(wal_dir) else {
