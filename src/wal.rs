@@ -132,7 +132,7 @@ pub fn get_wal_segsz(wal_path: &PathBuf) -> Result<u32, InvalidWalFile> {
 mod tests {
     use std::path::Path;
 
-    use crate::wal_utils::{search_directory, validate_wal_file};
+    use crate::wal::{search_directory, validate_wal_file};
 
     macro_rules! test_path {
         ($dirname:expr) => {

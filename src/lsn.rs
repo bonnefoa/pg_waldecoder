@@ -4,31 +4,29 @@ use thiserror::Error;
 
 #[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq, Error)]
 pub enum InvalidLSN {
-    #[error("No LSN provided")]
-    NoLSN,
     #[error("Invalid LSN Format '{0}'")]
-    InvalidFormat(String),
+    Format(String),
     #[error("Invalid filename: '{0}'")]
-    InvalidFileName(String),
+    FileName(String),
     #[error("Invalid hex value in '{0}': `{1}`")]
-    InvalidHexValue(String, String),
+    HexValue(String, String),
 }
 
 /// Convert a lsn string to a start ptr
 pub fn lsn_to_rec_ptr(lsn: &str) -> Result<u64, InvalidLSN> {
     let mut iter = lsn.split('/');
     let Some(xlogid_str) = iter.next() else {
-        return Err(InvalidLSN::InvalidFormat(lsn.to_string()));
+        return Err(InvalidLSN::Format(lsn.to_string()));
     };
     let xlogid = match u64::from_str_radix(xlogid_str, 16) {
         Ok(xlogid) => xlogid,
-        Err(e) => return Err(InvalidLSN::InvalidHexValue(lsn.to_string(), e.to_string())),
+        Err(e) => return Err(InvalidLSN::HexValue(lsn.to_string(), e.to_string())),
     };
 
     let xrecoff_str = iter.next().unwrap();
     let xrecoff = match u64::from_str_radix(xrecoff_str, 16) {
         Ok(xrecoff) => xrecoff,
-        Err(e) => return Err(InvalidLSN::InvalidHexValue(lsn.to_string(), e.to_string())),
+        Err(e) => return Err(InvalidLSN::HexValue(lsn.to_string(), e.to_string())),
     };
     Ok(xlogid << 32 | xrecoff)
 }
@@ -50,14 +48,14 @@ pub fn filename_to_startptr(
         .file_name()
         .and_then(|s| s.to_str())
     else {
-        return Err(InvalidLSN::InvalidFileName(filename.to_string()));
+        return Err(InvalidLSN::FileName(filename.to_string()));
     };
 
     let tli_str = &filename[0..8];
     let tli = match u64::from_str_radix(tli_str, 16) {
         Ok(tli) => tli,
         Err(e) => {
-            return Err(InvalidLSN::InvalidHexValue(
+            return Err(InvalidLSN::HexValue(
                 filename[0..8].to_string(),
                 e.to_string(),
             ))
@@ -68,7 +66,7 @@ pub fn filename_to_startptr(
     let log = match u64::from_str_radix(log_str, 16) {
         Ok(log) => log,
         Err(e) => {
-            return Err(InvalidLSN::InvalidHexValue(
+            return Err(InvalidLSN::HexValue(
                 log_str.to_string(),
                 e.to_string(),
             ))
@@ -79,7 +77,7 @@ pub fn filename_to_startptr(
     let seg = match u64::from_str_radix(seg_str, 16) {
         Ok(seg) => seg,
         Err(e) => {
-            return Err(InvalidLSN::InvalidHexValue(
+            return Err(InvalidLSN::HexValue(
                 seg_str.to_string(),
                 e.to_string(),
             ))
@@ -90,7 +88,7 @@ pub fn filename_to_startptr(
 
 #[cfg(any(test, feature = "pg_test"))]
 mod tests {
-    use crate::lsn_utils::{filename_to_startptr, xlog_file_name};
+    use crate::lsn::{filename_to_startptr, xlog_file_name};
 
     #[test]
     fn test_lsn_to_startptr() {

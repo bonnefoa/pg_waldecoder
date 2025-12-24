@@ -201,6 +201,9 @@ fn pg_waldecoder(
         );
     }
 
+    // TODO: Create custom mem context
+    record::read_next_record(xlog_reader);
+
     let results = vec![(
         1,
         1,
