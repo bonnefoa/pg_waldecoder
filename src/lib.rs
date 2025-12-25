@@ -1,19 +1,27 @@
 #![allow(dead_code)]
 mod lsn;
-mod wal;
 mod record;
+mod relation;
+mod wal;
+mod xlog_heap;
+mod xlog_reader;
 
 use std::{
-    ffi::{CStr, CString, c_void}, fs::File, io, os::fd::AsRawFd, path::Path
+    ffi::{c_void, CStr, CString},
+    fs::File,
+    io,
+    os::fd::AsRawFd,
+    path::Path,
 };
 
 use pgrx::{
-    pg_sys::{InvalidXLogRecPtr, TimeLineID, WALRead, WALReadError, XLogSegNo, XLOG_BLCKSZ},
+    pg_sys::{TimeLineID, WALRead, WALReadError, XLogSegNo, XLOG_BLCKSZ},
     prelude::*,
 };
 
 use crate::{
     lsn::{lsn_to_rec_ptr, xlog_file_name},
+    record::decode_wal_records,
     wal::detect_wal_dir,
 };
 
@@ -103,9 +111,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn pg_waldecoder_segment_close(
-    state: *mut pg_sys::XLogReaderState,
-) {
+unsafe extern "C-unwind" fn pg_waldecoder_segment_close(state: *mut pg_sys::XLogReaderState) {
     let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
     private.opened_segment = None;
 }
@@ -192,17 +198,7 @@ fn pg_waldecoder(
         )
     };
 
-    let first_record = unsafe { pg_sys::XLogFindNextRecord(xlog_reader, startptr) };
-    if first_record == u64::from(InvalidXLogRecPtr) {
-        error!(
-            "could not find a valid record after {:X}/{:X}",
-            startptr >> 32,
-            (startptr & 0xff00) as u32
-        );
-    }
-
-    // TODO: Create custom mem context
-    record::read_next_record(xlog_reader);
+    decode_wal_records(xlog_reader, startptr);
 
     let results = vec![(
         1,

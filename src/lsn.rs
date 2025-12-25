@@ -1,4 +1,4 @@
-use pgrx::pg_sys::{TimeLineID, XLogSegNo};
+use pgrx::pg_sys::{TimeLineID, XLogRecPtr, XLogSegNo};
 use std::path;
 use thiserror::Error;
 
@@ -29,6 +29,11 @@ pub fn lsn_to_rec_ptr(lsn: &str) -> Result<u64, InvalidLSN> {
         Err(e) => return Err(InvalidLSN::HexValue(lsn.to_string(), e.to_string())),
     };
     Ok(xlogid << 32 | xrecoff)
+}
+
+/// Returns file name for a provided timeline and record pointer
+pub fn format_lsn(rec_ptr: XLogRecPtr) -> String {
+    format!("{0:X}/{1:08X}", rec_ptr >> 32, (rec_ptr & 0xffff) as u32)
 }
 
 /// Returns file name for a provided timeline and record pointer
@@ -65,23 +70,13 @@ pub fn filename_to_startptr(
     let log_str = &filename[8..16];
     let log = match u64::from_str_radix(log_str, 16) {
         Ok(log) => log,
-        Err(e) => {
-            return Err(InvalidLSN::HexValue(
-                log_str.to_string(),
-                e.to_string(),
-            ))
-        }
+        Err(e) => return Err(InvalidLSN::HexValue(log_str.to_string(), e.to_string())),
     };
 
     let seg_str = &filename[16..24];
     let seg = match u64::from_str_radix(seg_str, 16) {
         Ok(seg) => seg,
-        Err(e) => {
-            return Err(InvalidLSN::HexValue(
-                seg_str.to_string(),
-                e.to_string(),
-            ))
-        }
+        Err(e) => return Err(InvalidLSN::HexValue(seg_str.to_string(), e.to_string())),
     };
     Ok((tli, log * 0x100000000 * wal_segsz_bytes + seg))
 }
