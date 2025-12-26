@@ -1,7 +1,7 @@
-use pgrx::pg_sys::{self, RelFileLocator, XLogRecGetBlockTag};
+use pgrx::{PgBox, pg_sys::{self, RelFileLocator, XLogRecGetBlockTag}};
 
 /// Get block tag info from latest decoded record
-pub fn get_block_tag(xlog_reader: *mut pg_sys::XLogReaderState) -> (RelFileLocator, i32, u32) {
+pub fn get_block_tag(xlog_reader: &PgBox<pg_sys::XLogReaderState>) -> (RelFileLocator, i32, u32) {
     let mut rlocator: RelFileLocator = RelFileLocator {
         spcOid: 0.into(),
         dbOid: 0.into(),
@@ -11,7 +11,7 @@ pub fn get_block_tag(xlog_reader: *mut pg_sys::XLogReaderState) -> (RelFileLocat
     let mut blknum: u32 = 0;
     unsafe {
         XLogRecGetBlockTag(
-            xlog_reader,
+            xlog_reader.as_ptr(),
             0,
             &raw mut rlocator,
             &raw mut forknum,

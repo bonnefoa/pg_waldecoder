@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 mod lsn;
 mod record;
 mod relation;

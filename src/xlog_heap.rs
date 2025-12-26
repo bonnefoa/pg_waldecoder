@@ -1,4 +1,4 @@
-use std::{ffi::CStr, mem::MaybeUninit};
+use std::ffi::CStr;
 
 use pgrx::{
     info,
@@ -6,14 +6,10 @@ use pgrx::{
     PgBox,
 };
 
-use crate::lsn::format_lsn;
-
-fn get_relid_from_record(rlocator: &pg_sys::RelFileLocator) -> Oid {
-    todo!()
-}
+use crate::{lsn::format_lsn, relation::get_relid_from_rlocator, xlog_reader::get_block_tag};
 
 pub fn decode_heap_record(
-    state: &PgBox<pg_sys::XLogReaderState>,
+    xlog_reader: &PgBox<pg_sys::XLogReaderState>,
     record: &PgBox<pg_sys::DecodedXLogRecord>,
 ) {
     if record.max_block_id < 0 {
@@ -26,6 +22,10 @@ pub fn decode_heap_record(
     info!(
         "Processing HEAP record {} at LSN {}",
         op_name_str,
-        format_lsn(state.ReadRecPtr)
+        format_lsn(xlog_reader.ReadRecPtr)
     );
+
+    let (rlocator, _, _) = get_block_tag(xlog_reader);
+    let relid = get_relid_from_rlocator(&rlocator);
+    info!("Got relid {relid:?}");
 }

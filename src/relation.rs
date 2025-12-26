@@ -1,64 +1,52 @@
-use std::{ffi::CStr, mem::MaybeUninit};
-
 use pgrx::{
-    info,
-    pg_sys::{self, Oid},
-    PgBox,
+    pg_sys::{self, InvalidOid, Oid},
+    prelude::*,
+    Spi,
 };
 
-/// For a given tablespace and relfilenode, find the matching relid
-pub fn get_spc_relnumber_relid(tablespace: Oid, relfilenode: Oid) -> Oid {
-    let mut key_1 = MaybeUninit::<pg_sys::ScanKeyData>::uninit();
-    let mut key_2 = MaybeUninit::<pg_sys::ScanKeyData>::uninit();
-    let lockmode = pg_sys::AccessShareLock.cast_signed();
-    let strategy = u16::try_from(pg_sys::BTEqualStrategyNumber).unwrap();
-    let procedure: Oid = pg_sys::F_OIDEQ.into();
-    unsafe {
-        pg_sys::ScanKeyInit(
-            key_1.as_mut_ptr(),
-            pg_sys::Anum_pg_class_reltablespace.try_into().unwrap(),
-            strategy,
-            procedure,
-            pg_sys::ObjectIdGetDatum(tablespace),
-        );
-        let key_1 = key_1.assume_init();
-        pg_sys::ScanKeyInit(
-            key_2.as_mut_ptr(),
-            pg_sys::Anum_pg_class_relfilenode.try_into().unwrap(),
-            strategy,
-            procedure,
-            pg_sys::ObjectIdGetDatum(relfilenode),
-        );
-        let key_2 = key_2.assume_init();
-        let mut keys = vec![key_1, key_2];
+/// Find the matching relid for the provided `RelFileLocator`
+pub fn get_relid_from_rlocator(rlocator: &pg_sys::RelFileLocator) -> Option<Oid> {
+    let tablespace = if rlocator.spcOid == pg_sys::DEFAULTTABLESPACE_OID {
+        InvalidOid
+    } else {
+        rlocator.spcOid
+    };
+    // pgrx would convert invalid oid to null, thus we need to manually build the datum
+    let tbl_arg = pg_sys::Datum::from(tablespace);
+    match Spi::get_one_with_args::<pg_sys::Oid>(
+        "SELECT oid FROM pg_class where relfilenode=$1 AND reltablespace=$2",
+        &[rlocator.relNumber.into(), tbl_arg.into()],
+    ) {
+        Ok(oid) => oid,
+        Err(e) => error!(
+            "Couldn't get oid for relation relfilnode {}, tablespace {}: {}",
+            rlocator.relNumber, rlocator.spcOid, e
+        ),
+    }
+}
 
-        let pg_class = pg_sys::table_open(pg_sys::RelationRelationId, lockmode);
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use crate::relation::get_relid_from_rlocator;
+    use pgrx::prelude::*;
 
-        let scan = pg_sys::systable_beginscan(
-            pg_class,
-            pg_sys::ClassTblspcRelfilenodeIndexId.into(),
-            true,
-            std::ptr::null_mut(),
-            2,
-            keys.as_mut_ptr(),
-        );
-
-        let tuple = pg_sys::systable_getnext(scan);
-        let relid = if tuple.is_null() {
-            pg_sys::InvalidOid
-        } else {
-            let tuple = PgBox::from_pg(tuple);
-            let t_data = PgBox::from_pg(tuple.t_data);
-            let ptr = tuple
-                .t_data
-                .add(t_data.t_hoff.into())
-                .cast::<pg_sys::FormData_pg_class>();
-            let form_pg_class = PgBox::from_pg(ptr);
-            form_pg_class.oid
+    #[pg_test]
+    fn test_get_relid_from_rlocator() {
+        let Ok((Some(expected_oid), Some(relfilenode), Some(tablespace))) =
+            Spi::get_three::<pg_sys::Oid, pg_sys::Oid, pg_sys::Oid>(
+                "SELECT oid, relfilenode, reltablespace FROM pg_class where relname='pg_statistic'",
+            )
+        else {
+            panic!("Couldn't get relfilenode and tablespace")
         };
-        pg_sys::systable_endscan(scan);
 
-        pg_sys::table_close(pg_class, lockmode);
-        relid
+        let rlocator = pg_sys::RelFileLocator {
+            spcOid: tablespace,
+            dbOid: 0.into(),
+            relNumber: relfilenode,
+        };
+        let relid = get_relid_from_rlocator(&rlocator).unwrap();
+        assert_eq!(relid, expected_oid);
     }
 }
