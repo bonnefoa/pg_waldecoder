@@ -226,7 +226,12 @@ mod tests {
     #[pg_test]
     fn test_pg_waldecoder() {
         let wal_dir = test_case!("18_single_upgrade");
-        // let wal_file = test_case!("000000010000000000000018");
+            Spi::run("CREATE TABLE test AS SELECT generate_series(1, 100) as id, '' AS data");
+            // Transaction isn't committed yet, force a flush so we can read the records from the
+            // WAL
+            pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
+        }
+        let startptr_str = format!("{startptr}");
         let _res = crate::pg_waldecoder("0/01800028", Some("0/01800D28"), 1, Some(wal_dir));
     }
 }

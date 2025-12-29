@@ -33,7 +33,7 @@ pub fn lsn_to_rec_ptr(lsn: &str) -> Result<u64, InvalidLSN> {
 
 /// Returns file name for a provided timeline and record pointer
 pub fn format_lsn(rec_ptr: XLogRecPtr) -> String {
-    format!("{0:X}/{1:08X}", rec_ptr >> 32, (rec_ptr & 0xffff) as u32)
+    format!("{0:X}/{1:08X}", rec_ptr >> 32, (rec_ptr & 0xffffffff) as u32)
 }
 
 /// Returns file name for a provided timeline and record pointer
