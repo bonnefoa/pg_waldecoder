@@ -15,8 +15,11 @@ default = ["pg18"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18" ]
 pg_test = []
 
+[dependencies.pgrx]
+path = "/home/sora/git-repos/pgrx/pgrx"
+
 [dependencies]
-pgrx = "=0.16.1"
+# pgrx = "=0.16.1"
 thiserror = "2.0.17"
 
 [dev-dependencies]

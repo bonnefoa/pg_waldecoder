@@ -6,22 +6,11 @@ use pgrx::{
 
 /// Find the matching relid for the provided `RelFileLocator`
 pub fn get_relid_from_rlocator(rlocator: &pg_sys::RelFileLocator) -> Option<Oid> {
-    let tablespace = if rlocator.spcOid == pg_sys::DEFAULTTABLESPACE_OID {
-        InvalidOid
-    } else {
-        rlocator.spcOid
-    };
-    // pgrx would convert invalid oid to null, thus we need to manually build the datum
-    let tbl_arg = pg_sys::Datum::from(tablespace);
-    match Spi::get_one_with_args::<pg_sys::Oid>(
-        "SELECT oid FROM pg_class where relfilenode=$1 AND reltablespace=$2",
-        &[rlocator.relNumber.into(), tbl_arg.into()],
-    ) {
-        Ok(oid) => oid,
-        Err(e) => error!(
-            "Couldn't get oid for relation relfilnode {}, tablespace {}: {}",
-            rlocator.relNumber, rlocator.spcOid, e
-        ),
+    unsafe {
+        match pg_sys::RelidByRelfilenumber(rlocator.spcOid, rlocator.relNumber) {
+            pg_sys::InvalidOid => None,
+            r => Some(r),
+        }
     }
 }
 

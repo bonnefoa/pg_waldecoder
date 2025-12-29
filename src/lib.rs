@@ -1,12 +1,15 @@
 mod lsn;
+mod pg_lsn;
 mod record;
 mod relation;
+mod tuple_str;
 mod wal;
 mod xlog_heap;
 mod xlog_reader;
 
 use std::{
     ffi::{c_void, CStr, CString},
+    fmt::Display,
     fs::File,
     io,
     os::fd::AsRawFd,
@@ -19,7 +22,7 @@ use pgrx::{
 };
 
 use crate::{
-    lsn::{lsn_to_rec_ptr, xlog_file_name},
+    lsn::{format_lsn, lsn_to_rec_ptr, xlog_file_name},
     record::decode_wal_records,
     wal::detect_wal_dir,
 };
@@ -42,6 +45,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_read_page(
     _target_ptr: pg_sys::XLogRecPtr,
     read_buff: *mut i8,
 ) -> i32 {
+    info!("Reading page {}", format_lsn(target_page_ptr));
     let pg_state = unsafe { PgBox::from_pg(state) };
     let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
     let blcksz = u64::from(XLOG_BLCKSZ);
@@ -102,7 +106,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
         .expect("Error converting wal_dir to cstr");
     let path = Path::new(wal_dir).join(&fname);
     let Ok(f) = File::open(&path) else {
-        error!("Could not open file \"{}\"", fname);
+        error!("Could not open file \"{}\"", path.display());
     };
     info!("Opening segment {}", path.display());
     pg_state.seg.ws_file = f.as_raw_fd();
@@ -183,6 +187,7 @@ fn pg_waldecoder(
     let Some((wal_dir, segsz)) = detect_wal_dir(wal_dir) else {
         error!("No valid WAL files found in wal dir")
     };
+    info!("Detected Wal dir: {}, segsz: {}", wal_dir.display(), segsz);
 
     let wal_dir_cstr = CString::new(wal_dir.to_str().expect("wal_dir conversion error"))
         .expect("WAL dir cstring conversion failed");
@@ -215,7 +220,11 @@ fn pg_waldecoder(
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
-    use pgrx::prelude::*;
+    use std::ffi::{CStr, CString};
+
+    use pgrx::{pg_sys::XLogRecPtr, prelude::*};
+
+    use crate::{lsn::format_lsn, pg_lsn::PgLSN};
 
     macro_rules! test_case {
         ($dirname:expr) => {
@@ -225,14 +234,16 @@ mod tests {
 
     #[pg_test]
     fn test_pg_waldecoder() {
-        let wal_dir = test_case!("18_single_upgrade");
+        let startptr = unsafe { format_lsn(pg_sys::GetXLogWriteRecPtr()) };
+
+        unsafe {
             Spi::run("CREATE TABLE test AS SELECT generate_series(1, 100) as id, '' AS data");
             // Transaction isn't committed yet, force a flush so we can read the records from the
             // WAL
             pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
         }
-        let startptr_str = format!("{startptr}");
-        let _res = crate::pg_waldecoder("0/01800028", Some("0/01800D28"), 1, Some(wal_dir));
+        let startptr_str = startptr.to_string();
+        let res = crate::pg_waldecoder(&startptr_str, None, 1, None);
     }
 }
 

@@ -1,6 +1,7 @@
 use std::ffi::CStr;
 
 use pgrx::pg_sys::InvalidXLogRecPtr;
+use pgrx::spi::Error;
 use pgrx::PgMemoryContexts;
 use pgrx::{
     error,
@@ -12,9 +13,18 @@ use pgrx::{
 use crate::lsn::format_lsn;
 use crate::xlog_heap::decode_heap_record;
 use crate::XLogReaderPrivate;
+use thiserror::Error;
+
+#[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq, Error)]
+pub enum WalError {
+    #[error("Could not read WAL at {0}: {1}")]
+    ReadRecordError(pg_sys::XLogRecPtr, String),
+}
 
 /// Advance xlogreader to the next record
-pub fn read_next_record(xlog_reader: *mut pg_sys::XLogReaderState) -> Option<*mut XLogRecord> {
+pub fn read_next_record(
+    xlog_reader: *mut pg_sys::XLogReaderState,
+) -> Result<Option<*mut XLogRecord>, WalError> {
     let pg_state = unsafe { PgBox::from_pg(xlog_reader) };
     let mut errormsg: *mut c_char = std::ptr::null_mut();
     let record = unsafe { pg_sys::XLogReadRecord(xlog_reader, &raw mut errormsg) };
@@ -22,21 +32,21 @@ pub fn read_next_record(xlog_reader: *mut pg_sys::XLogReaderState) -> Option<*mu
         let private =
             unsafe { PgBox::from_pg((*xlog_reader).private_data.cast::<XLogReaderPrivate>()) };
         if private.endptr_reached {
-            return None;
+            return Ok(None);
         }
         if !errormsg.is_null() {
-            let msg = unsafe { CStr::from_ptr(errormsg).to_string_lossy() };
-            error!(
-                "Could not read WAL at {}: {}",
-                format_lsn(pg_state.EndRecPtr),
-                msg
-            );
+            let msg = unsafe { CStr::from_ptr(errormsg).to_string_lossy().into_owned() };
+            return Err(WalError::ReadRecordError(pg_state.EndRecPtr, msg));
         }
     }
-    Some(record)
+    Ok(Some(record))
 }
 
-pub fn decode_wal_records(xlog_reader: *mut pg_sys::XLogReaderState, startptr: u64) {
+/// Process all WAL records until limit, endptr or end of wal is reached
+pub fn decode_wal_records(
+    xlog_reader: *mut pg_sys::XLogReaderState,
+    startptr: u64,
+) -> Option<WalError> {
     let pg_state = unsafe { PgBox::from_pg(xlog_reader) };
     let mut mem_ctx = PgMemoryContexts::new("Per record");
 
@@ -50,8 +60,8 @@ pub fn decode_wal_records(xlog_reader: *mut pg_sys::XLogReaderState, startptr: u
 
     loop {
         // Move to the next record
-        if read_next_record(xlog_reader).is_none() {
-            return;
+        if let Err(e) = read_next_record(xlog_reader) {
+            return Some(e);
         }
         // Get the latest decoded record from xlog reader
         let record = unsafe { PgBox::from_pg(pg_state.record) };
