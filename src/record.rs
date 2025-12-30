@@ -11,6 +11,7 @@ use pgrx::{
 };
 
 use crate::lsn::format_lsn;
+use crate::pg_lsn::PgLSN;
 use crate::xlog_heap::decode_heap_record;
 use crate::XLogReaderPrivate;
 use thiserror::Error;
@@ -45,17 +46,14 @@ pub fn read_next_record(
 /// Process all WAL records until limit, endptr or end of wal is reached
 pub fn decode_wal_records(
     xlog_reader: *mut pg_sys::XLogReaderState,
-    startptr: u64,
+    startptr: PgLSN,
 ) -> Option<WalError> {
     let pg_state = unsafe { PgBox::from_pg(xlog_reader) };
     let mut mem_ctx = PgMemoryContexts::new("Per record");
 
-    let first_record = unsafe { pg_sys::XLogFindNextRecord(xlog_reader, startptr) };
+    let first_record = unsafe { pg_sys::XLogFindNextRecord(xlog_reader, startptr.into()) };
     if first_record == u64::from(InvalidXLogRecPtr) {
-        error!(
-            "could not find a valid record after {}",
-            format_lsn(startptr)
-        );
+        error!("could not find a valid record after {}", startptr);
     }
 
     loop {

@@ -2,6 +2,8 @@ use pgrx::pg_sys::{TimeLineID, XLogRecPtr, XLogSegNo};
 use std::path;
 use thiserror::Error;
 
+use crate::pg_lsn::PgLSN;
+
 #[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq, Error)]
 pub enum InvalidLSN {
     #[error("Invalid LSN Format '{0}'")]
@@ -13,7 +15,7 @@ pub enum InvalidLSN {
 }
 
 /// Convert a lsn string to a start ptr
-pub fn lsn_to_rec_ptr(lsn: &str) -> Result<u64, InvalidLSN> {
+pub fn lsn_to_rec_ptr(lsn: &str) -> Result<PgLSN, InvalidLSN> {
     let mut iter = lsn.split('/');
     let Some(xlogid_str) = iter.next() else {
         return Err(InvalidLSN::Format(lsn.to_string()));
@@ -28,12 +30,16 @@ pub fn lsn_to_rec_ptr(lsn: &str) -> Result<u64, InvalidLSN> {
         Ok(xrecoff) => xrecoff,
         Err(e) => return Err(InvalidLSN::HexValue(lsn.to_string(), e.to_string())),
     };
-    Ok(xlogid << 32 | xrecoff)
+    Ok(PgLSN::from(xlogid << 32 | xrecoff))
 }
 
 /// Returns file name for a provided timeline and record pointer
 pub fn format_lsn(rec_ptr: XLogRecPtr) -> String {
-    format!("{0:X}/{1:08X}", rec_ptr >> 32, (rec_ptr & 0xffffffff) as u32)
+    format!(
+        "{0:X}/{1:08X}",
+        rec_ptr >> 32,
+        (rec_ptr & 0xffffffff) as u32
+    )
 }
 
 /// Returns file name for a provided timeline and record pointer
@@ -83,14 +89,14 @@ pub fn filename_to_startptr(
 
 #[cfg(any(test, feature = "pg_test"))]
 mod tests {
-    use crate::lsn::{filename_to_startptr, xlog_file_name};
+    use crate::{lsn::{filename_to_startptr, xlog_file_name}, pg_lsn::PgLSN};
 
     #[test]
     fn test_lsn_to_startptr() {
         let res = crate::lsn_to_rec_ptr("0/01800C50");
-        assert_eq!(res.unwrap(), 0x1800c50);
+        assert_eq!(res.unwrap(), PgLSN::from(0x1800c50_u64));
         let res = crate::lsn_to_rec_ptr("2/01800C50");
-        assert_eq!(res.unwrap(), 0x201800c50);
+        assert_eq!(res.unwrap(), PgLSN::from(0x201800c50_u64));
     }
 
     #[test]

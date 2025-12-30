@@ -22,17 +22,15 @@ use pgrx::{
 };
 
 use crate::{
-    lsn::{format_lsn, lsn_to_rec_ptr, xlog_file_name},
-    record::decode_wal_records,
-    wal::detect_wal_dir,
+    lsn::{format_lsn, lsn_to_rec_ptr, xlog_file_name}, pg_lsn::PgLSN, record::decode_wal_records, wal::detect_wal_dir
 };
 
 ::pgrx::pg_module_magic!(name, version);
 
 struct XLogReaderPrivate {
     timeline: u32,
-    startptr: u64,
-    endptr: Option<u64>,
+    startptr: PgLSN,
+    endptr: Option<PgLSN>,
     endptr_reached: bool,
     opened_segment: Option<File>,
 }
@@ -40,21 +38,23 @@ struct XLogReaderPrivate {
 #[pg_guard]
 unsafe extern "C-unwind" fn pg_waldecoder_read_page(
     state: *mut pg_sys::XLogReaderState,
-    target_page_ptr: pg_sys::XLogRecPtr,
+    target_page_ptr: u64,
     req_len: i32,
-    _target_ptr: pg_sys::XLogRecPtr,
+    target_ptr: u64,
     read_buff: *mut i8,
 ) -> i32 {
-    info!("Reading page {}", format_lsn(target_page_ptr));
+    let target_page_ptr = PgLSN::from(target_page_ptr);
+    let target_ptr = PgLSN::from(target_ptr);
+    info!("Reading page {}", target_page_ptr);
     let pg_state = unsafe { PgBox::from_pg(state) };
     let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
-    let blcksz = u64::from(XLOG_BLCKSZ);
+    let blcksz = XLOG_BLCKSZ;
     let count = match private.endptr {
         Some(endptr) => {
             if target_page_ptr + blcksz <= endptr {
                 blcksz
-            } else if target_page_ptr + u64::from(req_len.cast_unsigned()) <= endptr {
-                endptr - target_page_ptr
+            } else if target_page_ptr + req_len <= endptr {
+                (endptr - target_page_ptr).try_into().unwrap()
             } else {
                 private.endptr_reached = true;
                 return -1;
@@ -67,7 +67,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_read_page(
     if !WALRead(
         state,
         read_buff,
-        target_page_ptr,
+        target_page_ptr.into(),
         usize::try_from(count).unwrap(),
         private.timeline,
         errinfo,
@@ -242,8 +242,7 @@ mod tests {
             // WAL
             pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
         }
-        let startptr_str = startptr.to_string();
-        let res = crate::pg_waldecoder(&startptr_str, None, 1, None);
+        let res = crate::pg_waldecoder(&startptr, None, 1, None);
     }
 }
 
