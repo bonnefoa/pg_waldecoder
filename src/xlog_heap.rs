@@ -6,7 +6,7 @@ use pgrx::{
     PgBox,
 };
 
-use crate::{lsn::format_lsn, relation::get_relid_from_rlocator, xlog_reader::get_block_tag};
+use crate::{relation::get_relid_from_rlocator, xlog_reader::get_block_tag};
 
 fn item_pointer_set_invalid(mut item_pointer: pg_sys::ItemPointerData) {
     assert!(item_pointer.ip_posid != 0);
@@ -78,8 +78,7 @@ pub fn decode_heap_record(
     let op_name_str = unsafe { CStr::from_ptr(op_name).to_str().unwrap() };
     info!(
         "Processing HEAP record {} at LSN {}",
-        op_name_str,
-        format_lsn(xlog_reader.ReadRecPtr)
+        op_name_str, xlog_reader.ReadRecPtr
     );
 
     let (rlocator, _, _) = get_block_tag(xlog_reader);
@@ -87,7 +86,6 @@ pub fn decode_heap_record(
         pg_sys::warning!("Couldn't find oid for rlocator {:?}", rlocator);
         return;
     };
-
 
     //    match heap_op {
     //        XLOG_HEAP_INSERT => ,

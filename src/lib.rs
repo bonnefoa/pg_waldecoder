@@ -1,4 +1,3 @@
-mod lsn;
 mod pg_lsn;
 mod record;
 mod relation;
@@ -17,19 +16,20 @@ use std::{
 };
 
 use pgrx::{
-    pg_sys::{TimeLineID, WALRead, WALReadError, XLogSegNo, XLOG_BLCKSZ},
+    pg_sys::{TimeLineID, WALRead, WALReadError, XLogReaderState, XLogSegNo, XLOG_BLCKSZ},
     prelude::*,
 };
 
 use crate::{
-    lsn::{format_lsn, lsn_to_rec_ptr, xlog_file_name}, pg_lsn::PgLSN, record::{Results, decode_wal_records}, wal::detect_wal_dir
+    pg_lsn::{xlog_file_name, PgLSN},
+    record::decode_wal_records,
+    wal::detect_wal_dir,
 };
 
 ::pgrx::pg_module_magic!(name, version);
 
 struct XLogReaderPrivate {
     timeline: u32,
-    startptr: PgLSN,
     endptr: Option<PgLSN>,
     endptr_reached: bool,
     opened_segment: Option<File>,
@@ -46,7 +46,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_read_page(
     let target_page_ptr = PgLSN::from(target_page_ptr);
     let target_ptr = PgLSN::from(target_ptr);
     info!("Reading page {}", target_page_ptr);
-    let pg_state = unsafe { PgBox::from_pg(state) };
+    let xlog_reader = unsafe { PgBox::from_pg(state) };
     let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
     let blcksz = XLOG_BLCKSZ;
     let count = match private.endptr {
@@ -74,7 +74,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_read_page(
     ) {
         let errinfo = Box::from_raw(errinfo);
         let seg = errinfo.wre_seg;
-        let fname = xlog_file_name(seg.ws_tli, seg.ws_segno, pg_state.segcxt.ws_segsize);
+        let fname = xlog_file_name(seg.ws_tli, seg.ws_segno, xlog_reader.segcxt.ws_segsize);
 
         if errinfo.wre_errno != 0 {
             let error = io::Error::from_raw_os_error(errinfo.wre_errno);
@@ -98,10 +98,11 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
     next_seg_no: XLogSegNo,
     tli_ptr: *mut TimeLineID,
 ) {
-    let mut pg_state = unsafe { PgBox::from_pg(state) };
-    let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
-    let fname = xlog_file_name(*tli_ptr, next_seg_no, pg_state.segcxt.ws_segsize);
-    let wal_dir = CStr::from_ptr(pg_state.segcxt.ws_dir.as_ptr())
+    let mut xlog_reader = unsafe { PgBox::from_pg(state) };
+    let mut private =
+        unsafe { PgBox::from_pg(xlog_reader.private_data.cast::<XLogReaderPrivate>()) };
+    let fname = xlog_file_name(*tli_ptr, next_seg_no, xlog_reader.segcxt.ws_segsize);
+    let wal_dir = CStr::from_ptr(xlog_reader.segcxt.ws_dir.as_ptr())
         .to_str()
         .expect("Error converting wal_dir to cstr");
     let path = Path::new(wal_dir).join(&fname);
@@ -109,7 +110,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
         error!("Could not open file \"{}\"", path.display());
     };
     info!("Opening segment {}", path.display());
-    pg_state.seg.ws_file = f.as_raw_fd();
+    xlog_reader.seg.ws_file = f.as_raw_fd();
     private.opened_segment = Some(f);
 }
 
@@ -137,34 +138,14 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_close(state: *mut pg_sys::XLog
 //     todo!()
 // }
 
-#[pg_extern]
-fn pg_waldecoder(
-    start_lsn: &str,
-    end_lsn: default!(Option<&str>, "NULL"),
-    timeline: default!(i32, 1),
-    wal_dir: default!(Option<&str>, "NULL"),
-) -> TableIterator<
-    'static,
-    (
-        name!(oid, i64),
-        name!(relid, i64),
-        name!(xid, pg_sys::TransactionId),
-        name!(redo_query, &'static str),
-        name!(revert_query, &'static str),
-        name!(row_before, &'static str),
-        name!(row_after, &'static str),
-    ),
-> {
-    info!("Called with: {start_lsn:?}, {end_lsn:?}, {timeline:?}, {wal_dir:?}");
-
-    // Parse start ptr
-    let startptr = match lsn_to_rec_ptr(start_lsn) {
-        Ok(startptr) => startptr,
-        Err(e) => error!("Error: {}", e.to_string()),
-    };
-
+fn build_xlog_reader(
+    start_lsn: PgLSN,
+    end_lsn: Option<&str>,
+    timeline: i32,
+    wal_dir: Option<&str>,
+) -> PgBox<XLogReaderState> {
     // Parse end ptr
-    let endptr = match end_lsn.map(lsn_to_rec_ptr) {
+    let endptr = match end_lsn.map(|a| PgLSN::try_from(a)) {
         Some(Ok(endptr)) => Some(endptr),
         Some(Err(e)) => error!("Error: {}", e.to_string()),
         None => None,
@@ -172,7 +153,6 @@ fn pg_waldecoder(
 
     let private_data = Box::new(XLogReaderPrivate {
         timeline: timeline.cast_unsigned(),
-        startptr,
         endptr,
         endptr_reached: false,
         opened_segment: None,
@@ -201,39 +181,50 @@ fn pg_waldecoder(
             Box::into_raw(private_data).cast::<c_void>(),
         )
     };
+    unsafe { PgBox::from_pg(xlog_reader) }
+}
 
-    let (results, err) = decode_wal_records(xlog_reader, startptr);
+#[pg_extern]
+fn pg_waldecoder(
+    start_lsn: &str,
+    end_lsn: default!(Option<&str>, "NULL"),
+    timeline: default!(i32, 1),
+    wal_dir: default!(Option<&str>, "NULL"),
+) -> TableIterator<
+    'static,
+    (
+        name!(oid, i64),
+        name!(relid, i64),
+        name!(xid, pg_sys::TransactionId),
+        name!(redo_query, &'static str),
+        name!(revert_query, &'static str),
+        name!(row_before, &'static str),
+        name!(row_after, &'static str),
+    ),
+> {
+    info!("Called with: {start_lsn:?}, {end_lsn:?}, {timeline:?}, {wal_dir:?}");
 
-//    let results = vec![(
-//        1,
-//        1,
-//        pg_sys::TransactionId::from(1),
-//        "redo_query",
-//        "revert_query",
-//        "row before",
-//        "row_after",
-//    )];
+    // Parse start ptr
+    let startptr = match PgLSN::try_from(start_lsn) {
+        Ok(startptr) => startptr,
+        Err(e) => error!("Error: {}", e.to_string()),
+    };
+
+    let xlog_reader = build_xlog_reader(startptr, end_lsn, timeline, wal_dir);
+    let (results, err) = decode_wal_records(&xlog_reader, startptr);
     TableIterator::new(results)
 }
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
-    use std::ffi::{CStr, CString};
-
+    use crate::{build_xlog_reader, pg_lsn::PgLSN, record::decode_wal_records};
     use pgrx::{pg_sys::XLogRecPtr, prelude::*};
-
-    use crate::{lsn::format_lsn, pg_lsn::PgLSN};
-
-    macro_rules! test_case {
-        ($dirname:expr) => {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/resources/test/", $dirname)
-        };
-    }
+    use std::ffi::{CStr, CString};
 
     #[pg_test]
     fn test_pg_waldecoder() {
-        let startptr = unsafe { format_lsn(pg_sys::GetXLogWriteRecPtr()) };
+        let startptr = unsafe { PgLSN::from(pg_sys::GetXLogWriteRecPtr()) };
 
         unsafe {
             Spi::run("CREATE TABLE test AS SELECT generate_series(1, 100) as id, '' AS data");
@@ -241,7 +232,8 @@ mod tests {
             // WAL
             pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
         }
-        let res = crate::pg_waldecoder(&startptr, None, 1, None);
+        let xlog_reader = build_xlog_reader(startptr, None, 1, None);
+        let (results, err) = decode_wal_records(&xlog_reader, startptr);
     }
 }
 
