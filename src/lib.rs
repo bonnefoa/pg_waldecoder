@@ -22,7 +22,7 @@ use pgrx::{
 };
 
 use crate::{
-    lsn::{format_lsn, lsn_to_rec_ptr, xlog_file_name}, pg_lsn::PgLSN, record::decode_wal_records, wal::detect_wal_dir
+    lsn::{format_lsn, lsn_to_rec_ptr, xlog_file_name}, pg_lsn::PgLSN, record::{Results, decode_wal_records}, wal::detect_wal_dir
 };
 
 ::pgrx::pg_module_magic!(name, version);
@@ -202,18 +202,17 @@ fn pg_waldecoder(
         )
     };
 
-    decode_wal_records(xlog_reader, startptr);
+    let (results, err) = decode_wal_records(xlog_reader, startptr);
 
-    let results = vec![(
-        1,
-        1,
-        pg_sys::TransactionId::from(1),
-        "redo_query",
-        "revert_query",
-        "row before",
-        "row_after",
-    )];
-
+//    let results = vec![(
+//        1,
+//        1,
+//        pg_sys::TransactionId::from(1),
+//        "redo_query",
+//        "revert_query",
+//        "row before",
+//        "row_after",
+//    )];
     TableIterator::new(results)
 }
 

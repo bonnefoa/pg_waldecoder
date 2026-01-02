@@ -1,8 +1,9 @@
 use std::ffi::CStr;
 
+use pgrx::iter::TableIterator;
 use pgrx::pg_sys::InvalidXLogRecPtr;
 use pgrx::spi::Error;
-use pgrx::PgMemoryContexts;
+use pgrx::{PgMemoryContexts, name};
 use pgrx::{
     error,
     ffi::c_char,
@@ -21,6 +22,19 @@ pub enum WalError {
     #[error("Could not read WAL at {0}: {1}")]
     ReadRecordError(pg_sys::XLogRecPtr, String),
 }
+
+pub type Results = TableIterator<
+    'static,
+    (
+        name!(oid, i64),
+        name!(relid, i64),
+        name!(xid, pg_sys::TransactionId),
+        name!(redo_query, &'static str),
+        name!(revert_query, &'static str),
+        name!(row_before, &'static str),
+        name!(row_after, &'static str),
+    ),
+>;
 
 /// Advance xlogreader to the next record
 pub fn read_next_record(
@@ -47,9 +61,10 @@ pub fn read_next_record(
 pub fn decode_wal_records(
     xlog_reader: *mut pg_sys::XLogReaderState,
     startptr: PgLSN,
-) -> Option<WalError> {
+) -> (Results, Option<WalError>) {
     let pg_state = unsafe { PgBox::from_pg(xlog_reader) };
     let mut mem_ctx = PgMemoryContexts::new("Per record");
+    let mut results = vec!();
 
     let first_record = unsafe { pg_sys::XLogFindNextRecord(xlog_reader, startptr.into()) };
     if first_record == u64::from(InvalidXLogRecPtr) {
@@ -59,7 +74,7 @@ pub fn decode_wal_records(
     loop {
         // Move to the next record
         if let Err(e) = read_next_record(xlog_reader) {
-            return Some(e);
+            return (results, Some(e));
         }
         // Get the latest decoded record from xlog reader
         let record = unsafe { PgBox::from_pg(pg_state.record) };
