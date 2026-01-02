@@ -6,7 +6,7 @@ use pgrx::{
     PgBox,
 };
 
-use crate::{relation::get_relid_from_rlocator, xlog_reader::get_block_tag};
+use crate::{record::ResultColumns, relation::get_relid_from_rlocator, xlog_reader::get_block_tag};
 
 fn item_pointer_set_invalid(mut item_pointer: pg_sys::ItemPointerData) {
     assert!(item_pointer.ip_posid != 0);
@@ -68,10 +68,10 @@ pub fn get_heap_tuple(
 pub fn decode_heap_record(
     xlog_reader: &PgBox<pg_sys::XLogReaderState>,
     record: &PgBox<pg_sys::DecodedXLogRecord>,
-) {
+) -> Option<ResultColumns> {
     if record.max_block_id < 0 {
         // No need to process anything if there's no blocks
-        return;
+        return None;
     }
     let heap_op = u32::from(record.header.xl_info) & pg_sys::XLOG_HEAP_OPMASK;
     let op_name = unsafe { pg_sys::heap_identify(heap_op.try_into().unwrap()) };
@@ -84,10 +84,21 @@ pub fn decode_heap_record(
     let (rlocator, _, _) = get_block_tag(xlog_reader);
     let Some(relid) = get_relid_from_rlocator(&rlocator) else {
         pg_sys::warning!("Couldn't find oid for rlocator {:?}", rlocator);
-        return;
+        return None;
     };
 
     //    match heap_op {
     //        XLOG_HEAP_INSERT => ,
     //    }
+
+    Some((
+        record.lsn.cast_signed(),
+        rlocator.dbOid,
+        relid,
+        record.header.xl_xid,
+        "",
+        "",
+        "",
+        "",
+    ))
 }

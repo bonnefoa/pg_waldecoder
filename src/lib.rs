@@ -145,7 +145,7 @@ fn build_xlog_reader(
     wal_dir: Option<&str>,
 ) -> PgBox<XLogReaderState> {
     // Parse end ptr
-    let endptr = match end_lsn.map(|a| PgLSN::try_from(a)) {
+    let endptr = match end_lsn.map(PgLSN::try_from) {
         Some(Ok(endptr)) => Some(endptr),
         Some(Err(e)) => error!("Error: {}", e.to_string()),
         None => None,
@@ -193,8 +193,9 @@ fn pg_waldecoder(
 ) -> TableIterator<
     'static,
     (
-        name!(oid, i64),
-        name!(relid, i64),
+        name!(lsn, i64),
+        name!(dboid, pg_sys::Oid),
+        name!(relid, pg_sys::Oid),
         name!(xid, pg_sys::TransactionId),
         name!(redo_query, &'static str),
         name!(revert_query, &'static str),
@@ -234,6 +235,7 @@ mod tests {
         }
         let xlog_reader = build_xlog_reader(startptr, None, 1, None);
         let (results, err) = decode_wal_records(&xlog_reader, startptr);
+        assert_eq!(results.len(), 4);
     }
 }
 

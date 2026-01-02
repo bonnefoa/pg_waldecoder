@@ -23,8 +23,9 @@ pub enum WalError {
 }
 
 pub type ResultColumns = (
-    name!(oid, i64),
-    name!(relid, i64),
+    name!(lsn, i64),
+    name!(dboid, pg_sys::Oid),
+    name!(relid, pg_sys::Oid),
     name!(xid, pg_sys::TransactionId),
     name!(redo_query, &'static str),
     name!(revert_query, &'static str),
@@ -57,7 +58,6 @@ pub fn decode_wal_records(
     xlog_reader: &PgBox<pg_sys::XLogReaderState>,
     startptr: PgLSN,
 ) -> (Vec<ResultColumns>, Option<WalError>) {
-    // let xlog_reader = unsafe { PgBox::(xlog_reader) };
     let mut mem_ctx = PgMemoryContexts::new("Per record");
     let mut res = vec![];
 
@@ -77,10 +77,12 @@ pub fn decode_wal_records(
         let mut old_ctx = unsafe { mem_ctx.set_as_current() };
 
         let rmid = u32::from(record.header.xl_rmid);
-        match rmid {
+        let decoded_record = match rmid {
             RM_HEAP_ID => decode_heap_record(xlog_reader, &record),
-            _default => (),
-        }
+            _default => None,
+        };
+
+        decoded_record.map(|d| res.push(d));
 
         // Clean up
         unsafe { old_ctx.set_as_current() };
