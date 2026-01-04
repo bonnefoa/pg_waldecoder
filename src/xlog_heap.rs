@@ -1,12 +1,11 @@
-use std::ffi::CStr;
+use std::{collections::HashMap, ffi::CStr};
 
 use pgrx::{
-    pg_sys::{self, ItemPointerSetInvalid},
-    PgBox,
+    PgBox, pg_sys::{self, ItemPointerSetInvalid, RelFileLocator}
 };
 
 use crate::{
-    decoder::DecodedResult, relation::get_relid_from_rlocator, xlog_reader::get_block_tag,
+    decoder::{DecodedResult, PageId}, relation::get_relid_from_rlocator, xlog_reader::get_block_tag,
 };
 
 fn item_pointer_set_invalid(mut item_pointer: pg_sys::ItemPointerData) {
@@ -16,7 +15,7 @@ fn item_pointer_set_invalid(mut item_pointer: pg_sys::ItemPointerData) {
     item_pointer.ip_posid = pg_sys::InvalidOffsetNumber;
 }
 
-pub fn get_heap_tuple(
+fn get_heap_tuple(
     xlog_reader: &PgBox<pg_sys::XLogReaderState>,
     record: &PgBox<pg_sys::DecodedXLogRecord>,
     page: pg_sys::Page,
@@ -66,9 +65,18 @@ pub fn get_heap_tuple(
     }
 }
 
+fn apply_heap_record(
+    xlog_reader: &PgBox<pg_sys::XLogReaderState>,
+    page: pg_sys::Page,
+    block_id: i32,
+) {
+
+}
+
 pub fn decode_heap_record(
     xlog_reader: &PgBox<pg_sys::XLogReaderState>,
     record: &PgBox<pg_sys::DecodedXLogRecord>,
+    page_hash: &HashMap<PageId, pg_sys::Page>,
 ) -> Option<DecodedResult> {
     if record.max_block_id < 0 {
         // No need to process anything if there's no blocks
@@ -89,9 +97,9 @@ pub fn decode_heap_record(
         return None;
     };
 
-    //    match heap_op {
-    //        XLOG_HEAP_INSERT => ,
-    //    }
+    match heap_op {
+        XLOG_HEAP_INSERT => todo!(),
+    }
 
     Some(DecodedResult {
         lsn: record.lsn.cast_signed(),

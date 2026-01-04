@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::fs::File;
 use std::io;
@@ -63,10 +64,16 @@ impl
     }
 }
 
+pub struct PageId {
+    rlocator: pg_sys::RelFileLocator,
+    blknum: pg_sys::BlockNumber,
+}
+
 pub struct WalDecoder {
     xlog_reader: PgBox<pg_sys::XLogReaderState>,
     startptr: PgLSN,
     per_record_ctx: PgMemoryContexts,
+    page_hash: HashMap<PageId, pg_sys::Page>,
 }
 
 struct XLogReaderPrivate {
@@ -244,7 +251,7 @@ impl Iterator for WalDecoder {
             let mut old_ctx = unsafe { self.per_record_ctx.set_as_current() };
 
             let decoded_record = match rmid {
-                RM_HEAP_ID => decode_heap_record(&self.xlog_reader, &record),
+                RM_HEAP_ID => decode_heap_record(&self.xlog_reader, &record, &self.page_hash),
                 _ => panic!("Unexpected record type"),
             };
 
@@ -277,10 +284,12 @@ impl WalDecoder {
             error!("could not find a valid record after {}", startptr);
         }
 
+        let page_hash = HashMap::new();
         WalDecoder {
             xlog_reader,
             startptr,
             per_record_ctx,
+            page_hash,
         }
     }
 }
