@@ -19,6 +19,7 @@ use pgrx::{info, name, pg_guard, warning, PgMemoryContexts};
 use crate::pg_lsn::{xlog_file_name, PgLSN};
 use crate::wal::detect_wal_dir;
 use crate::xlog_heap::decode_heap_record;
+use crate::xlog_reader::get_block;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq, Error)]
@@ -38,8 +39,30 @@ pub struct DecodedResult {
     pub row_after: Option<&'static str>,
 }
 
-impl
-    From<DecodedResult> for (
+// #define XLogRecGetTotalLen(decoder) ((decoder)->record->header.xl_tot_len)
+// #define XLogRecGetPrev(decoder) ((decoder)->record->header.xl_prev)
+// #define XLogRecGetInfo(decoder) ((decoder)->record->header.xl_info)
+// #define XLogRecGetRmid(decoder) ((decoder)->record->header.xl_rmid)
+// #define XLogRecGetXid(decoder) ((decoder)->record->header.xl_xid)
+// #define XLogRecGetOrigin(decoder) ((decoder)->record->record_origin)
+// #define XLogRecGetTopXid(decoder) ((decoder)->record->toplevel_xid)
+// #define XLogRecGetData(decoder) ((decoder)->record->main_data)
+// #define XLogRecGetDataLen(decoder) ((decoder)->record->main_data_len)
+// #define XLogRecHasAnyBlockRefs(decoder) ((decoder)->record->max_block_id >= 0)
+// #define XLogRecMaxBlockId(decoder) ((decoder)->record->max_block_id)
+// #define XLogRecGetBlock(decoder, i) (&(decoder)->record->blocks[(i)])
+// #define XLogRecHasBlockRef(decoder, block_id)     \
+//   (((decoder)->record->max_block_id >= (block_id)) && \
+//    ((decoder)->record->blocks[block_id].in_use))
+// #define XLogRecHasBlockImage(decoder, block_id)   \
+//   ((decoder)->record->blocks[block_id].has_image)
+// #define XLogRecBlockImageApply(decoder, block_id)   \
+//   ((decoder)->record->blocks[block_id].apply_image)
+// #define XLogRecHasBlockData(decoder, block_id)    \
+//   ((decoder)->record->blocks[block_id].has_data)
+
+impl From<DecodedResult>
+    for (
         i64,
         pg_sys::Oid,
         pg_sys::Oid,
@@ -239,7 +262,8 @@ impl Iterator for WalDecoder {
             }
 
             // Get the latest decoded record from xlog reader
-            let record = unsafe { PgBox::from_pg(self.xlog_reader.record) };
+            let mut record = unsafe { PgBox::from_pg(self.xlog_reader.record) };
+
             let rmid = u32::from(record.header.xl_rmid);
 
             if rmid != RM_HEAP_ID {
@@ -250,9 +274,31 @@ impl Iterator for WalDecoder {
             // Switch to per record memory context
             let mut old_ctx = unsafe { self.per_record_ctx.set_as_current() };
 
+            // TODO: get block tag from record
+            let blknum:u8 = 0;
+            let page_id = PageId{rlocator, blknum};
+            let blk = get_block(&mut record, blknum);
+            if (blk.has_image && blk.apply_image) {
+                // We have a FPI, insert it in the page_hash
+                let page = unsafe {
+                    let page = pg_sys::palloc0(pg_sys::BLCKSZ as usize).cast::<i8>();
+                    let ok = pg_sys::RestoreBlockImage(self.xlog_reader.as_ptr(), blknum, page);
+                    if !ok {
+                        pg_sys::error!(
+                            "{}",
+                            CStr::from_ptr(self.xlog_reader.errormsg_buf)
+                                .to_str()
+                                .unwrap()
+                        );
+                    }
+                    page
+                };
+                self.page_hash.insert(page);
+            }
+
             let decoded_record = match rmid {
                 RM_HEAP_ID => decode_heap_record(&self.xlog_reader, &record, &self.page_hash),
-                _ => panic!("Unexpected record type"),
+                _ => panic!("Unsupported record type"),
             };
 
             // Clean up

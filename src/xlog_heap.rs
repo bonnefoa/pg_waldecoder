@@ -98,8 +98,10 @@ pub fn decode_heap_record(
     };
 
     match heap_op {
-        XLOG_HEAP_INSERT => todo!(),
-    }
+        pg_sys::XLOG_HEAP_INSERT => todo!(),
+        pg_sys::XLOG_HEAP_UPDATE | pg_sys::XLOG_HEAP_DELETE => todo!(),
+        _ => (),
+    };
 
     Some(DecodedResult {
         lsn: record.lsn.cast_signed(),
