@@ -6,7 +6,7 @@ use pgrx::{
     PgBox,
 };
 
-use crate::{record::ResultColumns, relation::get_relid_from_rlocator, xlog_reader::get_block_tag};
+use crate::{decoder::DecodedResult, relation::get_relid_from_rlocator, xlog_reader::get_block_tag};
 
 fn item_pointer_set_invalid(mut item_pointer: pg_sys::ItemPointerData) {
     assert!(item_pointer.ip_posid != 0);
@@ -68,7 +68,7 @@ pub fn get_heap_tuple(
 pub fn decode_heap_record(
     xlog_reader: &PgBox<pg_sys::XLogReaderState>,
     record: &PgBox<pg_sys::DecodedXLogRecord>,
-) -> Option<ResultColumns> {
+) -> Option<DecodedResult> {
     if record.max_block_id < 0 {
         // No need to process anything if there's no blocks
         return None;
