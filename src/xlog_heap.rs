@@ -1,12 +1,13 @@
 use std::ffi::CStr;
 
 use pgrx::{
-    info,
     pg_sys::{self, ItemPointerSetInvalid},
     PgBox,
 };
 
-use crate::{decoder::DecodedResult, relation::get_relid_from_rlocator, xlog_reader::get_block_tag};
+use crate::{
+    decoder::DecodedResult, relation::get_relid_from_rlocator, xlog_reader::get_block_tag,
+};
 
 fn item_pointer_set_invalid(mut item_pointer: pg_sys::ItemPointerData) {
     assert!(item_pointer.ip_posid != 0);
@@ -76,9 +77,10 @@ pub fn decode_heap_record(
     let heap_op = u32::from(record.header.xl_info) & pg_sys::XLOG_HEAP_OPMASK;
     let op_name = unsafe { pg_sys::heap_identify(heap_op.try_into().unwrap()) };
     let op_name_str = unsafe { CStr::from_ptr(op_name).to_str().unwrap() };
-    info!(
+    pg_sys::info!(
         "Processing HEAP record {} at LSN {}",
-        op_name_str, xlog_reader.ReadRecPtr
+        op_name_str,
+        xlog_reader.ReadRecPtr
     );
 
     let (rlocator, _, _) = get_block_tag(xlog_reader);
@@ -91,14 +93,14 @@ pub fn decode_heap_record(
     //        XLOG_HEAP_INSERT => ,
     //    }
 
-    Some((
-        record.lsn.cast_signed(),
-        rlocator.dbOid,
+    Some(DecodedResult {
+        lsn: record.lsn.cast_signed(),
+        dboid: rlocator.dbOid,
         relid,
-        record.header.xl_xid,
-        "",
-        "",
-        "",
-        "",
-    ))
+        xid: record.header.xl_xid,
+        redo_query: None,
+        revert_query: None,
+        row_before: None,
+        row_after: None,
+    })
 }

@@ -26,16 +26,42 @@ pub enum WalError {
     ReadRecordError(pg_sys::XLogRecPtr, String),
 }
 
-pub type DecodedResult = (
-    name!(lsn, i64),
-    name!(dboid, pg_sys::Oid),
-    name!(relid, pg_sys::Oid),
-    name!(xid, pg_sys::TransactionId),
-    name!(redo_query, &'static str),
-    name!(revert_query, &'static str),
-    name!(row_before, &'static str),
-    name!(row_after, &'static str),
-);
+pub struct DecodedResult {
+    pub lsn: i64,
+    pub dboid: pg_sys::Oid,
+    pub relid: pg_sys::Oid,
+    pub xid: pg_sys::TransactionId,
+    pub redo_query: Option<&'static str>,
+    pub revert_query: Option<&'static str>,
+    pub row_before: Option<&'static str>,
+    pub row_after: Option<&'static str>,
+}
+
+impl
+    From<DecodedResult> for (
+        i64,
+        pg_sys::Oid,
+        pg_sys::Oid,
+        pg_sys::TransactionId,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    )
+{
+    fn from(val: DecodedResult) -> Self {
+        (
+            val.lsn,
+            val.dboid,
+            val.relid,
+            val.xid,
+            val.redo_query,
+            val.revert_query,
+            val.row_before,
+            val.row_after,
+        )
+    }
+}
 
 pub struct WalDecoder {
     xlog_reader: PgBox<pg_sys::XLogReaderState>,

@@ -1,5 +1,5 @@
-mod pg_lsn;
 mod decoder;
+mod pg_lsn;
 mod relation;
 mod tuple_str;
 mod wal;
@@ -21,7 +21,9 @@ use pgrx::{
 };
 
 use crate::{
-    pg_lsn::{PgLSN, xlog_file_name}, decoder::WalDecoder, wal::detect_wal_dir
+    decoder::WalDecoder,
+    pg_lsn::{xlog_file_name, PgLSN},
+    wal::detect_wal_dir,
 };
 
 ::pgrx::pg_module_magic!(name, version);
@@ -40,10 +42,10 @@ fn pg_waldecoder(
         name!(dboid, pg_sys::Oid),
         name!(relid, pg_sys::Oid),
         name!(xid, pg_sys::TransactionId),
-        name!(redo_query, &'static str),
-        name!(revert_query, &'static str),
-        name!(row_before, &'static str),
-        name!(row_after, &'static str),
+        name!(redo_query, Option<&'static str>),
+        name!(revert_query, Option<&'static str>),
+        name!(row_before, Option<&'static str>),
+        name!(row_after, Option<&'static str>),
     ),
 > {
     info!("Called with: {start_lsn:?}, {end_lsn:?}, {timeline:?}, {wal_dir:?}");
@@ -55,30 +57,40 @@ fn pg_waldecoder(
     };
 
     let wal_decoder = WalDecoder::new(startptr, end_lsn, timeline, wal_dir);
-//    let (results, err) = decode_wal_records(&xlog_reader, startptr);
-    TableIterator::new(wal_decoder)
+    //    let (results, err) = decode_wal_records(&xlog_reader, startptr);
+    TableIterator::new(wal_decoder.map(std::convert::Into::into))
 }
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
-    use crate::{pg_lsn::PgLSN, decoder::{DecodedResult, WalDecoder}};
+    use crate::{
+        decoder::{DecodedResult, WalDecoder},
+        pg_lsn::PgLSN,
+    };
     use pgrx::{pg_sys::XLogRecPtr, prelude::*};
     use std::ffi::{CStr, CString};
 
     #[pg_test]
     fn test_pg_waldecoder() {
-        let startptr = unsafe { PgLSN::from(pg_sys::GetXLogWriteRecPtr()) };
-
         unsafe {
-            Spi::run("CREATE TABLE test AS SELECT generate_series(1, 100) as id, '' AS data");
+            Spi::run("CREATE TABLE test (id int, data text);");
+            pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
+        }
+
+        let startptr = unsafe { PgLSN::from(pg_sys::GetXLogWriteRecPtr()) };
+        unsafe {
+            Spi::run("Insert INTO test (id) values (1)");
             // Transaction isn't committed yet, force a flush so we can read the records from the
             // WAL
             pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
         }
+
         let wal_decoder = WalDecoder::new(startptr, None, 1, None);
         let results = wal_decoder.take(4).collect::<Vec<DecodedResult>>();
-        assert_eq!(results.len(), 4);
+        assert_eq!(results.len(), 1);
+        let decoded_record = &results[0];
+        assert!(decoded_record.redo_query.is_some());
     }
 }
 
