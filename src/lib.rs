@@ -184,6 +184,7 @@ fn build_xlog_reader(
     unsafe { PgBox::from_pg(xlog_reader) }
 }
 
+#[allow(clippy::type_complexity)]
 #[pg_extern]
 fn pg_waldecoder(
     start_lsn: &str,

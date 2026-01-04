@@ -22,7 +22,7 @@ pub enum WalError {
     ReadRecordError(pg_sys::XLogRecPtr, String),
 }
 
-pub type ResultColumns = (
+pub type DecodedResult = (
     name!(lsn, i64),
     name!(dboid, pg_sys::Oid),
     name!(relid, pg_sys::Oid),
@@ -57,7 +57,7 @@ pub fn read_next_record(
 pub fn decode_wal_records(
     xlog_reader: &PgBox<pg_sys::XLogReaderState>,
     startptr: PgLSN,
-) -> (Vec<ResultColumns>, Option<WalError>) {
+) -> (Vec<DecodedResult>, Option<WalError>) {
     let mut mem_ctx = PgMemoryContexts::new("Per record");
     let mut res = vec![];
 
