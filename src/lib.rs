@@ -1,19 +1,16 @@
-mod record;
 mod decoder;
 mod pg_lsn;
+mod record;
 mod relation;
 mod tuple_str;
 mod wal;
 mod xlog_heap;
 mod xlog_reader;
-
+mod page;
 
 use pgrx::prelude::*;
 
-use crate::{
-    decoder::WalDecoder,
-    pg_lsn::PgLSN,
-};
+use crate::{decoder::WalDecoder, pg_lsn::PgLSN};
 
 ::pgrx::pg_module_magic!(name, version);
 
@@ -62,15 +59,15 @@ mod tests {
     #[pg_test]
     fn test_decode_fpw() {
         unsafe {
-            Spi::run("CREATE TABLE test (id int, data text);");
-            Spi::run("Insert INTO test (id) values (1)");
-            Spi::run("CHECKPOINT;");
+            let _ = Spi::run("CREATE TABLE test (id int, data text);");
+            let _ = Spi::run("Insert INTO test (id) values (1)");
+            let _ = Spi::run("CHECKPOINT;");
             pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
         }
 
         let startptr = unsafe { PgLSN::from(pg_sys::GetXLogWriteRecPtr()) };
         unsafe {
-            Spi::run("Insert INTO test (id) values (2)");
+            let _ = Spi::run("Insert INTO test (id) values (2)");
             // Transaction isn't committed yet, force a flush so we can read the records from the
             // WAL
             pg_sys::XLogFlush(pg_sys::XactLastRecEnd);

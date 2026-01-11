@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt::{Display, Formatter};
 
-use pgrx::pg_sys::{DecodedBkpBlock, InvalidXLogRecPtr, Oid};
+use pgrx::pg_sys::{CurrentMemoryContext, DecodedBkpBlock, InvalidXLogRecPtr, Oid, PGAlignedBlock};
 use pgrx::{
     error,
     ffi::c_char,
     pg_sys::{self, RmgrIds::RM_HEAP_ID},
     PgBox,
 };
-use pgrx::{info, warning, PgMemoryContexts};
+use pgrx::{info, warning, AllocatedByRust, PgMemoryContexts};
 
 use crate::pg_lsn::PgLSN;
 use crate::relation::get_relid_from_rlocator;
@@ -86,7 +86,8 @@ pub struct WalDecoder {
     /// Current record from `xlog_reader`
     record: PgBox<pg_sys::DecodedXLogRecord>,
     per_record_ctx: PgMemoryContexts,
-    page_hash: HashMap<PageId, pg_sys::Page>,
+    function_ctx: PgMemoryContexts,
+    page_hash: HashMap<PageId, PgBox<pg_sys::PageHeaderData>>,
 }
 
 impl Iterator for WalDecoder {
@@ -105,48 +106,14 @@ impl Iterator for WalDecoder {
                 "Processing record at {}",
                 PgLSN::from(self.xlog_reader.ReadRecPtr)
             );
-            if self.record.max_block_id < 0 {
-                // No blocks available, skip it
-                warning!("No blocks available, skipping record");
-                continue;
-            }
-
-            let rmid = u32::from(self.record.header.xl_rmid);
-            if rmid != RM_HEAP_ID {
-                // Move to the next record
-                // TODO: Handle xlog, xact and heap2 records
-                info!("rmid {rmid}, skipping");
-                continue;
-            }
 
             // Switch to per record memory context
             let mut old_ctx = unsafe { self.per_record_ctx.set_as_current() };
 
-            let blk_id = 0;
-            let blk = self.get_block(blk_id);
-
-            // Do we have a FPW to apply?
-            let page_id = PageId::new(&blk);
-            if let Some(page) = self.restore_fpw(blk_id, &blk) {
-                // Insert it
-                info!("Found a FPW for page_id {page_id}");
-                self.page_hash.insert(page_id.clone(), page);
-            }
-
-            let Some(page) = self.page_hash.get(&page_id) else {
-                warning!("No page found for {page_id}, skipping record");
+            let decoded_record = self.process_current_record();
+            if decoded_record.is_none() {
                 continue;
-            };
-
-            let Some(relid) = get_relid_from_rlocator(&blk.rlocator) else {
-                pg_sys::warning!("Couldn't find oid for rlocator {:?}", blk.rlocator);
-                return None;
-            };
-
-            let decoded_record = match rmid {
-                RM_HEAP_ID => self.decode_heap_record(page, &blk, relid),
-                _ => panic!("Unsupported record type"),
-            };
+            }
 
             // Clean up
             unsafe { old_ctx.set_as_current() };
@@ -160,6 +127,7 @@ impl Iterator for WalDecoder {
 }
 
 impl WalDecoder {
+    /// Create a new `WalDecoder`
     pub fn new(
         startptr: PgLSN,
         end_lsn: Option<&str>,
@@ -169,6 +137,8 @@ impl WalDecoder {
         // Build the xlog reader
         let xlog_reader = xlog_reader::new(end_lsn, timeline, wal_dir);
         let per_record_ctx = PgMemoryContexts::new("Per decoded record");
+        // let function_ctx = unsafe { per_record_ctx.parent().unwrap() };
+        let function_ctx = PgMemoryContexts::CurrentMemoryContext;
 
         // Check we have can find valid wal files
         let first_record =
@@ -183,6 +153,7 @@ impl WalDecoder {
             xlog_reader,
             record,
             per_record_ctx,
+            function_ctx,
             page_hash,
         }
     }
@@ -212,16 +183,26 @@ impl WalDecoder {
         false
     }
 
-    fn restore_fpw(&self, blk_id: u8, blk: &PgBox<DecodedBkpBlock>) -> Option<pg_sys::Page> {
+    fn restore_fpw(
+        &self,
+        blk_id: u8,
+        blk: &PgBox<DecodedBkpBlock>,
+    ) -> Option<PgBox<pg_sys::PageHeaderData>> {
         if !blk.has_image || !blk.apply_image {
             // No FPW to restore
             return None;
         }
-
         // Yes, create the page and insert it
         let page = unsafe {
-            let page = pg_sys::palloc0(pg_sys::BLCKSZ as usize).cast::<i8>();
-            let ok = pg_sys::RestoreBlockImage(self.xlog_reader.as_ptr(), blk_id, page);
+            // Allocate the page
+            let page = PgBox::<pg_sys::PGAlignedBlock>::alloc0_in_context(
+                self.per_record_ctx.parent().unwrap(),
+            );
+            let ok = pg_sys::RestoreBlockImage(
+                self.xlog_reader.as_ptr(),
+                blk_id,
+                page.as_ptr().cast::<i8>(),
+            );
             if !ok {
                 pg_sys::error!(
                     "{}",
@@ -232,23 +213,61 @@ impl WalDecoder {
             }
             page
         };
-        Some(page)
+        Some(unsafe { PgBox::from_pg(page.as_ptr().cast::<pg_sys::PageHeaderData>()) })
     }
 
+    /// Get block at index `blk_id` for the current record
     fn get_block(&mut self, blk_id: u8) -> PgBox<pg_sys::DecodedBkpBlock> {
         unsafe { PgBox::from_pg(self.record.blocks.as_mut_ptr().add(blk_id as usize)) }
     }
 
-    fn apply_heap_record(
-        xlog_reader: &PgBox<pg_sys::XLogReaderState>,
-        page: pg_sys::Page,
-        block_id: u8,
-    ) {
+    fn process_current_record(&mut self) -> Option<DecodedResult> {
+        let rmid = u32::from(self.record.header.xl_rmid);
+        if rmid != RM_HEAP_ID {
+            // Move to the next record
+            // TODO: Handle xlog, xact and heap2 records
+            info!("rmid {rmid}, skipping");
+            return None;
+        }
+
+        if self.record.max_block_id < 0 {
+            // No blocks available, skip it
+            warning!("No blocks available, skipping record");
+            return None;
+        }
+
+        // TODO: Iterate through all blocks and apply fpw
+
+        let blk_id = 0;
+        let blk = self.get_block(blk_id);
+
+        // Do we have a FPW to apply?
+        let page_id = PageId::new(&blk);
+        if let Some(page) = self.restore_fpw(blk_id, &blk) {
+            // Insert it
+            info!("Found a FPW for page_id {page_id}");
+            self.page_hash.insert(page_id.clone(), page);
+        }
+
+        let Some(page) = self.page_hash.get(&page_id) else {
+            warning!("No page found for {page_id}, skipping record");
+            return None;
+        };
+
+        let Some(relid) = get_relid_from_rlocator(&blk.rlocator) else {
+            pg_sys::warning!("Couldn't find oid for rlocator {:?}", blk.rlocator);
+            return None;
+        };
+
+        match rmid {
+            RM_HEAP_ID => self.decode_heap_record(page, &blk, relid),
+            _ => panic!("Unsupported record type"),
+        }
     }
 
     pub fn decode_heap_record(
         &self,
-        page: &pg_sys::Page,
+        page: &PgBox<pg_sys::PageHeaderData>,
         blk: &PgBox<DecodedBkpBlock>,
         relid: Oid,
     ) -> Option<DecodedResult> {
@@ -262,7 +281,7 @@ impl WalDecoder {
         );
 
         match heap_op {
-            pg_sys::XLOG_HEAP_INSERT => todo!(),
+            pg_sys::XLOG_HEAP_INSERT => self.apply_heap_insert(page, blk),
             pg_sys::XLOG_HEAP_UPDATE | pg_sys::XLOG_HEAP_DELETE => todo!("Heap update and delete"),
             _ => return None,
         }
@@ -277,5 +296,16 @@ impl WalDecoder {
             row_before: None,
             row_after: None,
         })
+    }
+
+    fn apply_heap_insert(
+        &self,
+        page: &PgBox<pg_sys::PageHeaderData>,
+        blk: &PgBox<DecodedBkpBlock>,
+    ) {
+        if blk.has_image && blk.apply_image {
+            // This was a FPW, nothing to do
+            return;
+        }
     }
 }
