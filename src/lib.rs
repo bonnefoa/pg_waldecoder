@@ -1,3 +1,4 @@
+mod record;
 mod decoder;
 mod pg_lsn;
 mod relation;
@@ -72,15 +73,17 @@ mod tests {
     use std::ffi::{CStr, CString};
 
     #[pg_test]
-    fn test_pg_waldecoder() {
+    fn test_decode_fpw() {
         unsafe {
             Spi::run("CREATE TABLE test (id int, data text);");
+            Spi::run("Insert INTO test (id) values (1)");
+            Spi::run("CHECKPOINT;");
             pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
         }
 
         let startptr = unsafe { PgLSN::from(pg_sys::GetXLogWriteRecPtr()) };
         unsafe {
-            Spi::run("Insert INTO test (id) values (1)");
+            Spi::run("Insert INTO test (id) values (2)");
             // Transaction isn't committed yet, force a flush so we can read the records from the
             // WAL
             pg_sys::XLogFlush(pg_sys::XactLastRecEnd);

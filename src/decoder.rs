@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
+use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use pgrx::iter::TableIterator;
-use pgrx::pg_sys::InvalidXLogRecPtr;
+use pgrx::pg_sys::{DecodedBkpBlock, InvalidXLogRecPtr, Oid};
 use pgrx::spi::Error;
 use pgrx::{
     error,
@@ -17,9 +18,10 @@ use pgrx::{
 use pgrx::{info, name, pg_guard, warning, PgMemoryContexts};
 
 use crate::pg_lsn::{xlog_file_name, PgLSN};
+use crate::record::get_block;
+use crate::relation::get_relid_from_rlocator;
 use crate::wal::detect_wal_dir;
-use crate::xlog_heap::decode_heap_record;
-use crate::xlog_reader::get_block;
+use crate::xlog_reader;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq, Error)]
@@ -38,28 +40,6 @@ pub struct DecodedResult {
     pub row_before: Option<&'static str>,
     pub row_after: Option<&'static str>,
 }
-
-// #define XLogRecGetTotalLen(decoder) ((decoder)->record->header.xl_tot_len)
-// #define XLogRecGetPrev(decoder) ((decoder)->record->header.xl_prev)
-// #define XLogRecGetInfo(decoder) ((decoder)->record->header.xl_info)
-// #define XLogRecGetRmid(decoder) ((decoder)->record->header.xl_rmid)
-// #define XLogRecGetXid(decoder) ((decoder)->record->header.xl_xid)
-// #define XLogRecGetOrigin(decoder) ((decoder)->record->record_origin)
-// #define XLogRecGetTopXid(decoder) ((decoder)->record->toplevel_xid)
-// #define XLogRecGetData(decoder) ((decoder)->record->main_data)
-// #define XLogRecGetDataLen(decoder) ((decoder)->record->main_data_len)
-// #define XLogRecHasAnyBlockRefs(decoder) ((decoder)->record->max_block_id >= 0)
-// #define XLogRecMaxBlockId(decoder) ((decoder)->record->max_block_id)
-// #define XLogRecGetBlock(decoder, i) (&(decoder)->record->blocks[(i)])
-// #define XLogRecHasBlockRef(decoder, block_id)     \
-//   (((decoder)->record->max_block_id >= (block_id)) && \
-//    ((decoder)->record->blocks[block_id].in_use))
-// #define XLogRecHasBlockImage(decoder, block_id)   \
-//   ((decoder)->record->blocks[block_id].has_image)
-// #define XLogRecBlockImageApply(decoder, block_id)   \
-//   ((decoder)->record->blocks[block_id].apply_image)
-// #define XLogRecHasBlockData(decoder, block_id)    \
-//   ((decoder)->record->blocks[block_id].has_data)
 
 impl From<DecodedResult>
     for (
@@ -87,154 +67,42 @@ impl From<DecodedResult>
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PageId {
-    rlocator: pg_sys::RelFileLocator,
+    spc_oid: pg_sys::Oid,
+    db_oid: pg_sys::Oid,
+    rel_number: pg_sys::RelFileNumber,
     blknum: pg_sys::BlockNumber,
+}
+
+impl PageId {
+    fn new(blk: &PgBox<pg_sys::DecodedBkpBlock>) -> PageId {
+        PageId {
+            spc_oid: blk.rlocator.spcOid,
+            db_oid: blk.rlocator.dbOid,
+            rel_number: blk.rlocator.relNumber,
+            blknum: blk.blkno,
+        }
+    }
+}
+
+impl Display for PageId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{}/{}, blk {}",
+            self.spc_oid, self.db_oid, self.rel_number, self.blknum
+        )
+    }
 }
 
 pub struct WalDecoder {
     xlog_reader: PgBox<pg_sys::XLogReaderState>,
+    // Current record from xlog_reader
+    record: PgBox<pg_sys::DecodedXLogRecord>,
     startptr: PgLSN,
     per_record_ctx: PgMemoryContexts,
     page_hash: HashMap<PageId, pg_sys::Page>,
-}
-
-struct XLogReaderPrivate {
-    timeline: u32,
-    endptr: Option<PgLSN>,
-    endptr_reached: bool,
-    opened_segment: Option<File>,
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn pg_waldecoder_read_page(
-    state: *mut pg_sys::XLogReaderState,
-    target_page_ptr: u64,
-    req_len: i32,
-    target_ptr: u64,
-    read_buff: *mut i8,
-) -> i32 {
-    let target_page_ptr = PgLSN::from(target_page_ptr);
-    let target_ptr = PgLSN::from(target_ptr);
-    info!("Reading page {}", target_page_ptr);
-    let xlog_reader = unsafe { PgBox::from_pg(state) };
-    let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
-    let blcksz = pg_sys::XLOG_BLCKSZ;
-    let count = match private.endptr {
-        Some(endptr) => {
-            if target_page_ptr + blcksz <= endptr {
-                blcksz
-            } else if target_page_ptr + req_len <= endptr {
-                (endptr - target_page_ptr).try_into().unwrap()
-            } else {
-                private.endptr_reached = true;
-                return -1;
-            }
-        }
-        None => blcksz,
-    };
-
-    let errinfo = Box::into_raw(Box::new(pg_sys::WALReadError::default()));
-    if !pg_sys::WALRead(
-        state,
-        read_buff,
-        target_page_ptr.into(),
-        usize::try_from(count).unwrap(),
-        private.timeline,
-        errinfo,
-    ) {
-        let errinfo = Box::from_raw(errinfo);
-        let seg = errinfo.wre_seg;
-        let fname = xlog_file_name(seg.ws_tli, seg.ws_segno, xlog_reader.segcxt.ws_segsize);
-
-        if errinfo.wre_errno != 0 {
-            let error = io::Error::from_raw_os_error(errinfo.wre_errno);
-            error!(
-                "could not read from file {0}, offset {1}: {2}",
-                fname, errinfo.wre_off, error
-            );
-        } else {
-            error!(
-                "could not read from file {0}, offset {1}: read {2} of {3}",
-                fname, errinfo.wre_off, errinfo.wre_read, errinfo.wre_req
-            );
-        }
-    }
-    i32::try_from(count).unwrap()
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn pg_waldecoder_segment_open(
-    state: *mut pg_sys::XLogReaderState,
-    next_seg_no: pg_sys::XLogSegNo,
-    tli_ptr: *mut pg_sys::TimeLineID,
-) {
-    let mut xlog_reader = unsafe { PgBox::from_pg(state) };
-    let mut private =
-        unsafe { PgBox::from_pg(xlog_reader.private_data.cast::<XLogReaderPrivate>()) };
-    let fname = xlog_file_name(*tli_ptr, next_seg_no, xlog_reader.segcxt.ws_segsize);
-    let wal_dir = CStr::from_ptr(xlog_reader.segcxt.ws_dir.as_ptr())
-        .to_str()
-        .expect("Error converting wal_dir to cstr");
-    let path = Path::new(wal_dir).join(&fname);
-    let Ok(f) = File::open(&path) else {
-        error!("Could not open file \"{}\"", path.display());
-    };
-    info!("Opening segment {}", path.display());
-    xlog_reader.seg.ws_file = f.as_raw_fd();
-    private.opened_segment = Some(f);
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn pg_waldecoder_segment_close(state: *mut pg_sys::XLogReaderState) {
-    let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
-    private.opened_segment = None;
-}
-
-fn build_xlog_reader(
-    start_lsn: PgLSN,
-    end_lsn: Option<&str>,
-    timeline: i32,
-    wal_dir: Option<&str>,
-) -> PgBox<pg_sys::XLogReaderState> {
-    // Parse end ptr
-    let endptr = match end_lsn.map(PgLSN::try_from) {
-        Some(Ok(endptr)) => Some(endptr),
-        Some(Err(e)) => error!("Error: {}", e.to_string()),
-        None => None,
-    };
-
-    let private_data = Box::new(XLogReaderPrivate {
-        timeline: timeline.cast_unsigned(),
-        endptr,
-        endptr_reached: false,
-        opened_segment: None,
-    });
-
-    let xl_routine = Box::new(pg_sys::XLogReaderRoutine {
-        page_read: Some(pg_waldecoder_read_page),
-        segment_open: Some(pg_waldecoder_segment_open),
-        segment_close: Some(pg_waldecoder_segment_close),
-    });
-
-    let Some((wal_dir, segsz)) = detect_wal_dir(wal_dir) else {
-        error!("No valid WAL files found in wal dir")
-    };
-    info!("Detected Wal dir: {}, segsz: {}", wal_dir.display(), segsz);
-
-    let wal_dir_cstr = CString::new(wal_dir.to_str().expect("wal_dir conversion error"))
-        .expect("WAL dir cstring conversion failed");
-    let wal_dir_ptr = wal_dir_cstr.as_c_str().as_ptr();
-
-    let xlog_reader = unsafe {
-        pg_sys::XLogReaderAllocate(
-            segsz.cast_signed(),
-            wal_dir_ptr,
-            Box::into_raw(xl_routine),
-            Box::into_raw(private_data).cast::<c_void>(),
-        )
-    };
-    unsafe { PgBox::from_pg(xlog_reader) }
 }
 
 impl Iterator for WalDecoder {
@@ -242,62 +110,57 @@ impl Iterator for WalDecoder {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Move to the next record
-            let mut errormsg: *mut c_char = std::ptr::null_mut();
-            let record =
-                unsafe { pg_sys::XLogReadRecord(self.xlog_reader.as_ptr(), &raw mut errormsg) };
-            if record.is_null() {
-                let private = unsafe {
-                    PgBox::from_pg(self.xlog_reader.private_data.cast::<XLogReaderPrivate>())
-                };
-                if private.endptr_reached {
-                    return None;
-                }
-                if !errormsg.is_null() {
-                    let msg = unsafe { CStr::from_ptr(errormsg).to_string_lossy().into_owned() };
-                    warning!("Error getting next wal record: {msg}");
-                    // return Err(WalError::ReadRecordError(self.xlog_reader.EndRecPtr, msg));
-                    return None;
-                }
+            if self.move_to_next_record() {
+                return None;
             }
 
-            // Get the latest decoded record from xlog reader
-            let mut record = unsafe { PgBox::from_pg(self.xlog_reader.record) };
+            // Box decoded record from xlog reader
+            self.record = unsafe { PgBox::from_pg(self.xlog_reader.record) };
 
-            let rmid = u32::from(record.header.xl_rmid);
+            info!(
+                "Processing record at {}",
+                PgLSN::from(self.xlog_reader.ReadRecPtr)
+            );
+            if self.record.max_block_id < 0 {
+                // No blocks available, skip it
+                warning!("No blocks available, skipping record");
+                continue;
+            }
 
+            let rmid = u32::from(self.record.header.xl_rmid);
             if rmid != RM_HEAP_ID {
                 // Move to the next record
+                // TODO: Handle xlog, xact and heap2 records
+                info!("rmid {rmid}, skipping");
                 continue;
             }
 
             // Switch to per record memory context
             let mut old_ctx = unsafe { self.per_record_ctx.set_as_current() };
 
-            // TODO: get block tag from record
-            let blknum:u8 = 0;
-            let page_id = PageId{rlocator, blknum};
-            let blk = get_block(&mut record, blknum);
-            if (blk.has_image && blk.apply_image) {
-                // We have a FPI, insert it in the page_hash
-                let page = unsafe {
-                    let page = pg_sys::palloc0(pg_sys::BLCKSZ as usize).cast::<i8>();
-                    let ok = pg_sys::RestoreBlockImage(self.xlog_reader.as_ptr(), blknum, page);
-                    if !ok {
-                        pg_sys::error!(
-                            "{}",
-                            CStr::from_ptr(self.xlog_reader.errormsg_buf)
-                                .to_str()
-                                .unwrap()
-                        );
-                    }
-                    page
-                };
-                self.page_hash.insert(page);
+            let blk_id = 0;
+            let blk = self.get_block(blk_id);
+
+            // Do we have a FPW to apply?
+            let page_id = PageId::new(&blk);
+            if let Some(page) = self.restore_fpw(blk_id, &blk) {
+                // Insert it
+                info!("Found a FPW for page_id {page_id}");
+                self.page_hash.insert(page_id.clone(), page);
             }
 
+            let Some(page) = self.page_hash.get(&page_id) else {
+                warning!("No page found for {page_id}, skipping record");
+                continue;
+            };
+
+            let Some(relid) = get_relid_from_rlocator(&blk.rlocator) else {
+                pg_sys::warning!("Couldn't find oid for rlocator {:?}", blk.rlocator);
+                return None;
+            };
+
             let decoded_record = match rmid {
-                RM_HEAP_ID => decode_heap_record(&self.xlog_reader, &record, &self.page_hash),
+                RM_HEAP_ID => self.decode_heap_record(page, &blk, relid),
                 _ => panic!("Unsupported record type"),
             };
 
@@ -320,7 +183,7 @@ impl WalDecoder {
         wal_dir: Option<&str>,
     ) -> WalDecoder {
         // Build the xlog reader
-        let xlog_reader = build_xlog_reader(startptr, end_lsn, timeline, wal_dir);
+        let xlog_reader = xlog_reader::new(startptr, end_lsn, timeline, wal_dir);
         let mut per_record_ctx = PgMemoryContexts::new("Per decoded record");
 
         // Check we have can find valid wal files
@@ -331,11 +194,106 @@ impl WalDecoder {
         }
 
         let page_hash = HashMap::new();
+        let record = unsafe { PgBox::from_pg(xlog_reader.record) };
         WalDecoder {
             xlog_reader,
+            record,
             startptr,
             per_record_ctx,
             page_hash,
         }
+    }
+
+    /// Advance reader to the next record. Returns true if end is reached.
+    fn move_to_next_record(&mut self) -> bool {
+        let mut errormsg: *mut c_char = std::ptr::null_mut();
+        let record =
+            unsafe { pg_sys::XLogReadRecord(self.xlog_reader.as_ptr(), &raw mut errormsg) };
+        if record.is_null() {
+            let private = unsafe {
+                PgBox::from_pg(
+                    self.xlog_reader
+                        .private_data
+                        .cast::<xlog_reader::XLogReaderPrivate>(),
+                )
+            };
+            if private.endptr_reached {
+                return true;
+            }
+            if !errormsg.is_null() {
+                let msg = unsafe { CStr::from_ptr(errormsg).to_string_lossy().into_owned() };
+                warning!("Error getting next wal record: {msg}");
+                // return Err(WalError::ReadRecordError(self.xlog_reader.EndRecPtr, msg));
+                return true;
+            }
+        }
+        false
+    }
+
+    fn restore_fpw(&self, blk_id: u8, blk: &PgBox<DecodedBkpBlock>) -> Option<pg_sys::Page> {
+        if (!blk.has_image || !blk.apply_image) {
+            // No FPW to restore
+            return None;
+        }
+
+        // Yes, create the page and insert it
+        let page = unsafe {
+            let page = pg_sys::palloc0(pg_sys::BLCKSZ as usize).cast::<i8>();
+            let ok = pg_sys::RestoreBlockImage(self.xlog_reader.as_ptr(), blk_id, page);
+            if !ok {
+                pg_sys::error!(
+                    "{}",
+                    CStr::from_ptr(self.xlog_reader.errormsg_buf)
+                        .to_str()
+                        .unwrap()
+                );
+            }
+            page
+        };
+        Some(page)
+    }
+
+    fn get_block(&mut self, blk_id: u8) -> PgBox<pg_sys::DecodedBkpBlock> {
+        unsafe { PgBox::from_pg(self.record.blocks.as_mut_ptr().add(blk_id as usize)) }
+    }
+
+    fn apply_heap_record(
+        xlog_reader: &PgBox<pg_sys::XLogReaderState>,
+        page: pg_sys::Page,
+        block_id: u8,
+    ) {
+    }
+
+    pub fn decode_heap_record(
+        &self,
+        page: &pg_sys::Page,
+        blk: &PgBox<DecodedBkpBlock>,
+        relid: Oid,
+    ) -> Option<DecodedResult> {
+        let heap_op = u32::from(self.record.header.xl_info) & pg_sys::XLOG_HEAP_OPMASK;
+        let op_name = unsafe { pg_sys::heap_identify(heap_op.try_into().unwrap()) };
+        let op_name_str = unsafe { CStr::from_ptr(op_name).to_str().unwrap() };
+        pg_sys::info!(
+            "Processing HEAP record {} at LSN {}",
+            op_name_str,
+            self.xlog_reader.ReadRecPtr
+        );
+
+        match heap_op {
+            pg_sys::XLOG_HEAP_INSERT => todo!(),
+            pg_sys::XLOG_HEAP_UPDATE | pg_sys::XLOG_HEAP_DELETE => todo!("Heap update and delete"),
+            _ => return None,
+        }
+
+        Some(DecodedResult {
+            lsn: self.record.lsn.cast_signed(),
+            dboid: blk.rlocator.dbOid,
+            relid,
+            xid: self.record.header.xl_xid,
+            redo_query: None,
+            revert_query: None,
+            row_before: None,
+            row_after: None,
+        })
     }
 }
