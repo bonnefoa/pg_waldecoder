@@ -7,24 +7,12 @@ mod wal;
 mod xlog_heap;
 mod xlog_reader;
 
-use std::{
-    ffi::{c_void, CStr, CString},
-    fmt::Display,
-    fs::File,
-    io,
-    os::fd::AsRawFd,
-    path::Path,
-};
 
-use pgrx::{
-    pg_sys::{TimeLineID, WALRead, XLogReaderState, XLogSegNo, XLOG_BLCKSZ},
-    prelude::*,
-};
+use pgrx::prelude::*;
 
 use crate::{
     decoder::WalDecoder,
-    pg_lsn::{xlog_file_name, PgLSN},
-    wal::detect_wal_dir,
+    pg_lsn::PgLSN,
 };
 
 ::pgrx::pg_module_magic!(name, version);
@@ -69,8 +57,7 @@ mod tests {
         decoder::{DecodedResult, WalDecoder},
         pg_lsn::PgLSN,
     };
-    use pgrx::{pg_sys::XLogRecPtr, prelude::*};
-    use std::ffi::{CStr, CString};
+    use pgrx::prelude::*;
 
     #[pg_test]
     fn test_decode_fpw() {

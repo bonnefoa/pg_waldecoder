@@ -1,34 +1,19 @@
 use std::collections::HashMap;
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::CStr;
 use std::fmt::{Display, Formatter};
-use std::fs::File;
-use std::io;
-use std::os::fd::AsRawFd;
-use std::path::Path;
 
-use pgrx::iter::TableIterator;
 use pgrx::pg_sys::{DecodedBkpBlock, InvalidXLogRecPtr, Oid};
-use pgrx::spi::Error;
 use pgrx::{
     error,
     ffi::c_char,
-    pg_sys::{self, RmgrIds::RM_HEAP_ID, XLogRecord},
+    pg_sys::{self, RmgrIds::RM_HEAP_ID},
     PgBox,
 };
-use pgrx::{info, name, pg_guard, warning, PgMemoryContexts};
+use pgrx::{info, warning, PgMemoryContexts};
 
-use crate::pg_lsn::{xlog_file_name, PgLSN};
-use crate::record::get_block;
+use crate::pg_lsn::PgLSN;
 use crate::relation::get_relid_from_rlocator;
-use crate::wal::detect_wal_dir;
 use crate::xlog_reader;
-use thiserror::Error;
-
-#[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq, Error)]
-pub enum WalError {
-    #[error("Could not read WAL at {0}: {1}")]
-    ReadRecordError(pg_sys::XLogRecPtr, String),
-}
 
 pub struct DecodedResult {
     pub lsn: i64,
@@ -98,9 +83,8 @@ impl Display for PageId {
 
 pub struct WalDecoder {
     xlog_reader: PgBox<pg_sys::XLogReaderState>,
-    // Current record from xlog_reader
+    /// Current record from `xlog_reader`
     record: PgBox<pg_sys::DecodedXLogRecord>,
-    startptr: PgLSN,
     per_record_ctx: PgMemoryContexts,
     page_hash: HashMap<PageId, pg_sys::Page>,
 }
@@ -183,8 +167,8 @@ impl WalDecoder {
         wal_dir: Option<&str>,
     ) -> WalDecoder {
         // Build the xlog reader
-        let xlog_reader = xlog_reader::new(startptr, end_lsn, timeline, wal_dir);
-        let mut per_record_ctx = PgMemoryContexts::new("Per decoded record");
+        let xlog_reader = xlog_reader::new(end_lsn, timeline, wal_dir);
+        let per_record_ctx = PgMemoryContexts::new("Per decoded record");
 
         // Check we have can find valid wal files
         let first_record =
@@ -198,7 +182,6 @@ impl WalDecoder {
         WalDecoder {
             xlog_reader,
             record,
-            startptr,
             per_record_ctx,
             page_hash,
         }
@@ -223,7 +206,6 @@ impl WalDecoder {
             if !errormsg.is_null() {
                 let msg = unsafe { CStr::from_ptr(errormsg).to_string_lossy().into_owned() };
                 warning!("Error getting next wal record: {msg}");
-                // return Err(WalError::ReadRecordError(self.xlog_reader.EndRecPtr, msg));
                 return true;
             }
         }
@@ -231,7 +213,7 @@ impl WalDecoder {
     }
 
     fn restore_fpw(&self, blk_id: u8, blk: &PgBox<DecodedBkpBlock>) -> Option<pg_sys::Page> {
-        if (!blk.has_image || !blk.apply_image) {
+        if !blk.has_image || !blk.apply_image {
             // No FPW to restore
             return None;
         }

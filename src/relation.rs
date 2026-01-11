@@ -1,8 +1,6 @@
-use pgrx::{
-    pg_sys::{self, InvalidOid, Oid},
-    prelude::*,
-    Spi,
-};
+use pgrx::pg_sys::{self, Oid};
+
+use pgrx::prelude::pg_schema;
 
 /// Find the matching relid for the provided `RelFileLocator`
 pub fn get_relid_from_rlocator(rlocator: &pg_sys::RelFileLocator) -> Option<Oid> {

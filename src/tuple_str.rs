@@ -1,10 +1,4 @@
-use std::num::NonZeroUsize;
-
-use pgrx::{
-    pg_sys::{self, HeapTuple},
-    prelude::*,
-    PgBox, PgTupleDesc,
-};
+use pgrx::prelude::*;
 
 pub fn append_values(
     mut buffer: String,

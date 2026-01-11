@@ -5,8 +5,6 @@ use pgrx::pgrx_sql_entity_graph::metadata::{
     ArgumentError, Returns, ReturnsError, SqlMapping, SqlTranslatable,
 };
 use pgrx::prelude::*;
-use pgrx::{rust_regtypein, StringInfo};
-use std::ffi::CStr;
 use std::fmt::{Display, Formatter};
 use std::num::TryFromIntError;
 use std::ops::{Add, Sub};

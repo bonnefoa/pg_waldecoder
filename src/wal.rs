@@ -13,8 +13,6 @@ const WAL_SEG_MAX_SIZE: u32 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq, Error)]
 pub enum InvalidWalFile {
-    #[error("Io error: {0}")]
-    IoError(String),
     #[error("Invalid WAL file name {0}")]
     InvalidFileName(String),
     #[error("Could not read WAL file {0}: {1}")]

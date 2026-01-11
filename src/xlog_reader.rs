@@ -1,50 +1,18 @@
-use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
-use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-use pgrx::iter::TableIterator;
-use pgrx::pg_sys::{DecodedBkpBlock, InvalidXLogRecPtr, Oid};
-use pgrx::spi::Error;
 use pgrx::{
     error,
-    ffi::c_char,
-    pg_sys::{self, RmgrIds::RM_HEAP_ID, XLogRecord},
+    pg_sys::{self},
     PgBox,
 };
-use pgrx::{info, name, pg_guard, warning, PgMemoryContexts};
+use pgrx::{info, pg_guard};
 
 use crate::pg_lsn::{xlog_file_name, PgLSN};
-use crate::record::get_block;
-use crate::relation::get_relid_from_rlocator;
 use crate::wal::detect_wal_dir;
-use thiserror::Error;
-
-use pgrx::pg_sys::{RelFileLocator, XLogRecGetBlockTag};
-
-/// Get block tag info from latest decoded record
-pub fn get_block_tag(xlog_reader: &PgBox<pg_sys::XLogReaderState>) -> (RelFileLocator, i32, u32) {
-    let mut rlocator: RelFileLocator = RelFileLocator {
-        spcOid: 0.into(),
-        dbOid: 0.into(),
-        relNumber: 0.into(),
-    };
-    let mut forknum: i32 = 0;
-    let mut blknum: u32 = 0;
-    unsafe {
-        XLogRecGetBlockTag(
-            xlog_reader.as_ptr(),
-            0,
-            &raw mut rlocator,
-            &raw mut forknum,
-            &raw mut blknum,
-        );
-    };
-    (rlocator, forknum, blknum)
-}
 
 pub struct XLogReaderPrivate {
     pub timeline: u32,
@@ -62,7 +30,7 @@ unsafe extern "C-unwind" fn pg_waldecoder_read_page(
     read_buff: *mut i8,
 ) -> i32 {
     let target_page_ptr = PgLSN::from(target_page_ptr);
-    let target_ptr = PgLSN::from(target_ptr);
+    let _target_ptr = PgLSN::from(target_ptr);
     info!("Reading page {}", target_page_ptr);
     let xlog_reader = unsafe { PgBox::from_pg(state) };
     let mut private = unsafe { PgBox::from_pg((*state).private_data.cast::<XLogReaderPrivate>()) };
@@ -139,7 +107,6 @@ unsafe extern "C-unwind" fn pg_waldecoder_segment_close(state: *mut pg_sys::XLog
 }
 
 pub fn new(
-    start_lsn: PgLSN,
     end_lsn: Option<&str>,
     timeline: i32,
     wal_dir: Option<&str>,

@@ -1,11 +1,6 @@
-use std::{collections::HashMap, ffi::CStr};
-
 use pgrx::{
-    PgBox, pg_sys::{self, ItemPointerSetInvalid, RelFileLocator}
-};
-
-use crate::{
-    decoder::{DecodedResult, PageId}, relation::get_relid_from_rlocator, xlog_reader::get_block_tag,
+    pg_sys::{self},
+    PgBox,
 };
 
 fn item_pointer_set_invalid(mut item_pointer: pg_sys::ItemPointerData) {
@@ -63,4 +58,3 @@ fn get_heap_tuple(
         Some(tuple.into_pg())
     }
 }
-
