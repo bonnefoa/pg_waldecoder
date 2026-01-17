@@ -79,6 +79,33 @@ mod tests {
         let decoded_record = &results[0];
         assert!(decoded_record.redo_query.is_some());
     }
+
+    #[pg_test]
+    fn test_decode_heap_insert() {
+        unsafe {
+            let _ = Spi::run("CREATE TABLE test (id int, data text);");
+            let _ = Spi::run("CHECKPOINT;");
+            pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
+        }
+
+        let startptr = unsafe { PgLSN::from(pg_sys::GetXLogWriteRecPtr()) };
+        unsafe {
+            let _ = Spi::run("Insert INTO test (id) values (1)");
+            let _ = Spi::run("Insert INTO test (id) values (2)");
+            // Transaction isn't committed yet, force a flush so we can read the records from the
+            // WAL
+            pg_sys::XLogFlush(pg_sys::XactLastRecEnd);
+        }
+
+        let wal_decoder = WalDecoder::new(startptr, None, 1, None);
+        let results = wal_decoder.take(4).collect::<Vec<DecodedResult>>();
+        assert_eq!(results.len(), 1);
+        let decoded_record = &results[0];
+        assert!(decoded_record.redo_query.is_some());
+    }
+
+
+
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt::{Display, Formatter};
+use std::mem;
 
-use pgrx::pg_sys::{CurrentMemoryContext, DecodedBkpBlock, InvalidXLogRecPtr, Oid, PGAlignedBlock};
+use pgrx::pg_sys::{
+    CurrentMemoryContext, DecodedBkpBlock, InvalidXLogRecPtr, Oid, PGAlignedBlock, RmgrIds,
+};
 use pgrx::{
     error,
     ffi::c_char,
@@ -13,7 +16,7 @@ use pgrx::{info, warning, AllocatedByRust, PgMemoryContexts};
 
 use crate::pg_lsn::PgLSN;
 use crate::relation::get_relid_from_rlocator;
-use crate::xlog_reader;
+use crate::{page, xlog_reader};
 
 pub struct DecodedResult {
     pub lsn: i64,
@@ -87,7 +90,7 @@ pub struct WalDecoder {
     record: PgBox<pg_sys::DecodedXLogRecord>,
     per_record_ctx: PgMemoryContexts,
     function_ctx: PgMemoryContexts,
-    page_hash: HashMap<PageId, PgBox<pg_sys::PageHeaderData>>,
+    page_hash: HashMap<PageId, PgBox<pg_sys::PGAlignedBlock, AllocatedByRust>>,
 }
 
 impl Iterator for WalDecoder {
@@ -126,6 +129,27 @@ impl Iterator for WalDecoder {
     }
 }
 
+fn get_block_data(blk: &PgBox<DecodedBkpBlock>) -> Option<*mut i8> {
+    if !blk.in_use {
+        return None;
+    }
+    if !blk.has_data {
+        return None;
+    }
+    Some(blk.data)
+}
+
+const SIZE_OF_PAGE_HEADER_DATA: usize = mem::offset_of!(pg_sys::PageHeaderData, pd_linp);
+
+const SIZE_OF_HEAP_HEADER: usize =
+    mem::offset_of!(pg_sys::xl_heap_header, t_hoff) + mem::size_of::<u8>();
+const SIZE_OF_HEAP_TUPLE_HEADER: usize =
+    mem::offset_of!(pg_sys::HeapTupleHeaderData, t_bits) + mem::size_of::<u8>();
+const SIZE_OF_HEAP_INSERT: usize =
+    mem::offset_of!(pg_sys::xl_heap_insert, flags) + mem::size_of::<u8>();
+const MAX_HEAP_TUPLE_SIZE: usize =
+    pg_sys::BLCKSZ as usize - (SIZE_OF_PAGE_HEADER_DATA + mem::size_of::<pg_sys::ItemIdData>());
+
 impl WalDecoder {
     /// Create a new `WalDecoder`
     pub fn new(
@@ -137,7 +161,6 @@ impl WalDecoder {
         // Build the xlog reader
         let xlog_reader = xlog_reader::new(end_lsn, timeline, wal_dir);
         let per_record_ctx = PgMemoryContexts::new("Per decoded record");
-        // let function_ctx = unsafe { per_record_ctx.parent().unwrap() };
         let function_ctx = PgMemoryContexts::CurrentMemoryContext;
 
         // Check we have can find valid wal files
@@ -148,7 +171,7 @@ impl WalDecoder {
         }
 
         let page_hash = HashMap::new();
-        let record = unsafe { PgBox::from_pg(xlog_reader.record) };
+        let record = PgBox::null();
         WalDecoder {
             xlog_reader,
             record,
@@ -183,16 +206,15 @@ impl WalDecoder {
         false
     }
 
-    fn restore_fpw(
-        &self,
-        blk_id: u8,
-        blk: &PgBox<DecodedBkpBlock>,
-    ) -> Option<PgBox<pg_sys::PageHeaderData>> {
+    fn process_fpw(&mut self, blk_id: u8) {
+        let blk = self.get_block(blk_id);
+        let page_id = PageId::new(&blk);
         if !blk.has_image || !blk.apply_image {
             // No FPW to restore
-            return None;
+            return;
         }
-        // Yes, create the page and insert it
+
+        // We have a FPW, create the page and insert it
         let page = unsafe {
             // Allocate the page
             let page = PgBox::<pg_sys::PGAlignedBlock>::alloc0_in_context(
@@ -213,7 +235,41 @@ impl WalDecoder {
             }
             page
         };
-        Some(unsafe { PgBox::from_pg(page.as_ptr().cast::<pg_sys::PageHeaderData>()) })
+        self.page_hash.insert(page_id.clone(), page);
+    }
+
+    fn get_rmid(&self) -> u32 {
+        u32::from(self.record.header.xl_rmid)
+    }
+
+    fn get_page(&self, page_id: &PageId) -> Option<PgBox<pg_sys::PageHeaderData>> {
+        self.page_hash
+            .get(page_id)
+            .map(|page| unsafe { PgBox::from_pg(page.as_ptr().cast::<pg_sys::PageHeaderData>()) })
+    }
+
+    fn process_init_record(&mut self, blk_id: u8) {
+        let blk = self.get_block(blk_id);
+        let page_id = PageId::new(&blk);
+
+        if (self.record.header.xl_info & u8::try_from(pg_sys::XLOG_HEAP_INIT_PAGE).unwrap()) == 0 {
+            return;
+        }
+        info!("Found a init heap for {page_id}, insert page in hashmap");
+        let page = unsafe {
+            PgBox::<pg_sys::PGAlignedBlock>::alloc0_in_context(
+                self.per_record_ctx.parent().unwrap(),
+            )
+        };
+        unsafe {
+            pg_sys::PageInit(
+                page.as_ptr().cast(),
+                mem::size_of::<pg_sys::PGAlignedBlock>(),
+                0,
+            );
+        };
+        let page_cast = unsafe { PgBox::from_pg(page.as_ptr().cast::<pg_sys::PageHeaderData>()) };
+        self.page_hash.insert(page_id.clone(), page);
     }
 
     /// Get block at index `blk_id` for the current record
@@ -222,9 +278,8 @@ impl WalDecoder {
     }
 
     fn process_current_record(&mut self) -> Option<DecodedResult> {
-        let rmid = u32::from(self.record.header.xl_rmid);
+        let rmid = self.get_rmid();
         if rmid != RM_HEAP_ID {
-            // Move to the next record
             // TODO: Handle xlog, xact and heap2 records
             info!("rmid {rmid}, skipping");
             return None;
@@ -239,20 +294,19 @@ impl WalDecoder {
         // TODO: Iterate through all blocks and apply fpw
 
         let blk_id = 0;
-        let blk = self.get_block(blk_id);
 
         // Do we have a FPW to apply?
-        let page_id = PageId::new(&blk);
-        if let Some(page) = self.restore_fpw(blk_id, &blk) {
-            // Insert it
-            info!("Found a FPW for page_id {page_id}");
-            self.page_hash.insert(page_id.clone(), page);
-        }
+        self.process_fpw(blk_id);
+        // Or a init record?
+        self.process_init_record(blk_id);
 
-        let Some(page) = self.page_hash.get(&page_id) else {
+        let blk = self.get_block(blk_id);
+        let page_id = PageId::new(&blk);
+        let Some(page) = self.get_page(&page_id) else {
             warning!("No page found for {page_id}, skipping record");
             return None;
         };
+        pg_sys::info!("Page {:?}", page);
 
         let Some(relid) = get_relid_from_rlocator(&blk.rlocator) else {
             pg_sys::warning!("Couldn't find oid for rlocator {:?}", blk.rlocator);
@@ -260,7 +314,7 @@ impl WalDecoder {
         };
 
         match rmid {
-            RM_HEAP_ID => self.decode_heap_record(page, &blk, relid),
+            RM_HEAP_ID => self.decode_heap_record(&page, &blk, relid),
             _ => panic!("Unsupported record type"),
         }
     }
@@ -306,6 +360,55 @@ impl WalDecoder {
         if blk.has_image && blk.apply_image {
             // This was a FPW, nothing to do
             return;
+        }
+
+        assert!(
+            usize::from(page.pd_lower) <= SIZE_OF_PAGE_HEADER_DATA,
+            "invalid max offset number, {0} > {SIZE_OF_PAGE_HEADER_DATA}",
+            page.pd_lower
+        );
+
+        let data_len = usize::from(blk.data_len);
+        let block_data = get_block_data(blk).unwrap();
+        let data = unsafe { std::slice::from_raw_parts(block_data, data_len) };
+
+        // Data block stores only part of the tuple header.
+        let xlhdr: PgBox<pg_sys::xl_heap_header> =
+            unsafe { PgBox::from_pg(block_data.cast::<pg_sys::xl_heap_header>()) };
+
+        info!("xlhdr: {xlhdr:?}");
+        let new_len = data_len - SIZE_OF_HEAP_HEADER;
+        assert!(data_len > SIZE_OF_HEAP_HEADER && new_len <= MAX_HEAP_TUPLE_SIZE);
+
+        let mut htup_vec = vec![0i8; MAX_HEAP_TUPLE_SIZE];
+        htup_vec[SIZE_OF_HEAP_HEADER..SIZE_OF_HEAP_HEADER + new_len]
+            .copy_from_slice(&data[0..SIZE_OF_HEAP_HEADER]);
+        let mut htup = unsafe {
+            PgBox::<pg_sys::HeapTupleHeaderData, AllocatedByRust>::from_rust(
+                htup_vec.as_mut_ptr().cast::<pg_sys::HeapTupleHeaderData>(),
+            )
+        };
+        htup.t_infomask2 = xlhdr.t_infomask2;
+        htup.t_infomask = xlhdr.t_infomask;
+        htup.t_hoff = xlhdr.t_hoff;
+        htup.t_choice.t_heap.t_xmin = self.record.header.xl_xid;
+        htup.t_choice.t_heap.t_field3.t_cid = 0;
+        htup.t_infomask &= !u16::try_from(pg_sys::HEAP_COMBOCID).unwrap();
+
+        unsafe {
+            let xlrec: PgBox<pg_sys::xl_heap_insert> = PgBox::from_pg(self.record.main_data.cast());
+            if pg_sys::PageAddItemExtended(
+                page.as_ptr().cast::<i8>(),
+                htup.as_ptr().cast::<i8>(),
+                new_len,
+                xlrec.offnum,
+                (pg_sys::PAI_OVERWRITE | pg_sys::PAI_IS_HEAP)
+                    .try_into()
+                    .unwrap(),
+            ) == pg_sys::InvalidOffsetNumber
+            {
+                panic!("failed to add tuple");
+            }
         }
     }
 }
