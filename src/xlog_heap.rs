@@ -3,12 +3,7 @@ use pgrx::{
     PgBox,
 };
 
-fn item_pointer_set_invalid(mut item_pointer: pg_sys::ItemPointerData) {
-    assert!(item_pointer.ip_posid != 0);
-    item_pointer.ip_blkid.bi_hi = 0xFFFF;
-    item_pointer.ip_blkid.bi_lo = 0xFFFF;
-    item_pointer.ip_posid = pg_sys::InvalidOffsetNumber;
-}
+use crate::item;
 
 fn get_heap_tuple(
     record: &PgBox<pg_sys::DecodedXLogRecord>,
@@ -53,7 +48,7 @@ fn get_heap_tuple(
         let mut tuple = PgBox::<pg_sys::HeapTupleData>::alloc0();
         tuple.t_data = htuple.cast();
         tuple.t_len = htup_len;
-        item_pointer_set_invalid(tuple.t_self);
+        item::pointer_set_invalid(tuple.t_self);
         tuple.t_tableOid = relid;
         Some(tuple.into_pg())
     }

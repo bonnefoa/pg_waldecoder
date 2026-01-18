@@ -1,3 +1,5 @@
+use std::{mem, num::NonZero};
+
 use pgrx::prelude::*;
 
 pub fn append_values(
@@ -17,20 +19,45 @@ pub fn append_values(
     }
 }
 
-pub fn generate_insert_query(relname: &str, heap_tuple: &PgHeapTuple<AllocatedByRust>) -> String {
-    // let natts = tuple_desc.len();
-    // let mut is_null = (0..natts).map(|_| true).collect::<Vec<_>>();
-    //        let heap_tuple_data = pg_sys::heap_form_tuple(
-    //            tuple_desc.as_ptr(),
-    //            std::ptr::null_mut(),
-    //            is_null.as_mut_ptr(),
-    //        );
-    //    let heap_tuple = unsafe { PgHeapTuple::from_heap_tuple(tuple_desc, heap_tuple_data) };
+pub fn generate_insert_query(
+    relname: &str,
+    heap_tuple: &PgHeapTuple<AllocatedByPostgres>,
+) -> String {
+    info!("Content: {0:?}", heap_tuple
+                    .get_by_index::<String>(NonZero::new(1).unwrap())
+                    .expect("value must exist"));
 
-    let attribute_names = heap_tuple
+    let idxs = heap_tuple
         .attributes()
-        .filter(|(_, v)| v.is_dropped())
-        .map(|(_, v)| v.name()).collect::<Vec<_>>();
+        .filter(|(i, att)| {
+            !att.is_dropped()
+                && heap_tuple
+                    .get_by_index::<String>(*i)
+                    .expect("value must exist")
+                    .is_some()
+        })
+        .map(|(i, _)| i)
+        .collect::<Vec<NonZero<usize>>>();
 
-    format!("INSERT INTO {relname} ({})", attribute_names.join(","))
+    let attributes = idxs
+        .clone()
+        .into_iter()
+        .map(|i| heap_tuple.get_attribute_by_index(i).unwrap().name())
+        .collect::<Vec<_>>();
+
+    let values = idxs
+        .into_iter()
+        .map(|i| {
+            heap_tuple
+                .get_by_index(i)
+                .expect("Value must exist")
+                .expect("Value must be non null")
+        })
+        .collect::<Vec<String>>();
+
+    format!(
+        "INSERT INTO {relname} ({}) VALUES ({})",
+        attributes.join(","),
+        values.join(",")
+    )
 }

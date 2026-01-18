@@ -3,30 +3,29 @@ use std::ffi::CStr;
 use std::fmt::{Display, Formatter};
 use std::mem;
 
-use pgrx::pg_sys::{
-    CurrentMemoryContext, DecodedBkpBlock, InvalidXLogRecPtr, Oid, PGAlignedBlock, RmgrIds,
-};
+use pgrx::pg_sys::{DecodedBkpBlock, InvalidXLogRecPtr, Oid, PGAlignedBlock, RmgrIds};
+use pgrx::prelude::PgHeapTuple;
 use pgrx::{
     error,
     ffi::c_char,
     pg_sys::{self, RmgrIds::RM_HEAP_ID},
     PgBox,
 };
-use pgrx::{info, warning, AllocatedByRust, PgMemoryContexts};
+use pgrx::{info, warning, AllocatedByRust, PgMemoryContexts, PgTupleDesc};
 
 use crate::pg_lsn::PgLSN;
 use crate::relation::get_relid_from_rlocator;
-use crate::{page, xlog_reader};
+use crate::{item, page, tuple_str, xlog_reader};
 
 pub struct DecodedResult {
     pub lsn: i64,
     pub dboid: pg_sys::Oid,
     pub relid: pg_sys::Oid,
     pub xid: pg_sys::TransactionId,
-    pub redo_query: Option<&'static str>,
-    pub revert_query: Option<&'static str>,
-    pub row_before: Option<&'static str>,
-    pub row_after: Option<&'static str>,
+    pub redo_query: Option<String>,
+    pub revert_query: Option<String>,
+    pub row_before: Option<String>,
+    pub row_after: Option<String>,
 }
 
 impl From<DecodedResult>
@@ -35,10 +34,10 @@ impl From<DecodedResult>
         pg_sys::Oid,
         pg_sys::Oid,
         pg_sys::TransactionId,
-        Option<&'static str>,
-        Option<&'static str>,
-        Option<&'static str>,
-        Option<&'static str>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
     )
 {
     fn from(val: DecodedResult) -> Self {
@@ -147,6 +146,7 @@ const SIZE_OF_HEAP_TUPLE_HEADER: usize =
     mem::offset_of!(pg_sys::HeapTupleHeaderData, t_bits) + mem::size_of::<u8>();
 const SIZE_OF_HEAP_INSERT: usize =
     mem::offset_of!(pg_sys::xl_heap_insert, flags) + mem::size_of::<u8>();
+const HEAP_TUPLE_SIZE: usize = mem::size_of::<pg_sys::HeapTupleData>();
 const MAX_HEAP_TUPLE_SIZE: usize =
     pg_sys::BLCKSZ as usize - (SIZE_OF_PAGE_HEADER_DATA + mem::size_of::<pg_sys::ItemIdData>());
 
@@ -325,7 +325,7 @@ impl WalDecoder {
         blk: &PgBox<DecodedBkpBlock>,
         relid: Oid,
     ) -> Option<DecodedResult> {
-        let heap_op = u32::from(self.record.header.xl_info) & pg_sys::XLOG_HEAP_OPMASK;
+        let heap_op = self.get_heap_op();
         let op_name = unsafe { pg_sys::heap_identify(heap_op.try_into().unwrap()) };
         let op_name_str = unsafe { CStr::from_ptr(op_name).to_str().unwrap() };
         pg_sys::info!(
@@ -334,24 +334,52 @@ impl WalDecoder {
             self.xlog_reader.ReadRecPtr
         );
 
-        match heap_op {
-            pg_sys::XLOG_HEAP_INSERT => self.apply_heap_insert(page, blk),
+        let (relname, tupdesc) = unsafe {
+            let relation = PgBox::from_pg(pg_sys::table_open(
+                relid,
+                pg_sys::AccessShareLock.cast_signed(),
+            ));
+            // let tupdesc = PgBox::from_pg(pg_sys::CreateTupleDescCopy(relation.rd_att));
+            let tupdesc = PgTupleDesc::from_pg(pg_sys::CreateTupleDescCopy(relation.rd_att));
+            let rdata = PgBox::from_pg(relation.rd_rel);
+            let relname = CStr::from_ptr(rdata.relname.data.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+            (relname, tupdesc)
+        };
+
+        let redo_query = match heap_op {
+            pg_sys::XLOG_HEAP_INSERT => {
+                self.apply_heap_insert(page, blk);
+                let newtup = self.get_heap_tuple(page, relid, false).unwrap();
+                let heap_tuple = unsafe { PgHeapTuple::from_heap_tuple(tupdesc, newtup.into_pg()) };
+                Some(tuple_str::generate_insert_query(&relname, &heap_tuple))
+            }
             pg_sys::XLOG_HEAP_UPDATE | pg_sys::XLOG_HEAP_DELETE => todo!("Heap update and delete"),
             _ => return None,
-        }
+        };
 
         Some(DecodedResult {
             lsn: self.record.lsn.cast_signed(),
             dboid: blk.rlocator.dbOid,
             relid,
             xid: self.record.header.xl_xid,
-            redo_query: None,
+            redo_query,
             revert_query: None,
             row_before: None,
             row_after: None,
         })
     }
 
+    fn get_xlrec<T>(&self) -> PgBox<T> {
+        unsafe { PgBox::from_pg(self.record.main_data.cast()) }
+    }
+
+    fn get_heap_op(&self) -> u32 {
+        u32::from(self.record.header.xl_info) & pg_sys::XLOG_HEAP_OPMASK
+    }
+
+    /// Apply the current heap insert record
     fn apply_heap_insert(
         &self,
         page: &PgBox<pg_sys::PageHeaderData>,
@@ -362,10 +390,12 @@ impl WalDecoder {
             return;
         }
 
+        let xlrec: PgBox<pg_sys::xl_heap_insert> = self.get_xlrec();
+
         assert!(
-            usize::from(page.pd_lower) <= SIZE_OF_PAGE_HEADER_DATA,
+            usize::from(xlrec.offnum) <= SIZE_OF_PAGE_HEADER_DATA,
             "invalid max offset number, {0} > {SIZE_OF_PAGE_HEADER_DATA}",
-            page.pd_lower
+            xlrec.offnum
         );
 
         let data_len = usize::from(blk.data_len);
@@ -383,11 +413,8 @@ impl WalDecoder {
         let mut htup_vec = vec![0i8; MAX_HEAP_TUPLE_SIZE];
         htup_vec[SIZE_OF_HEAP_HEADER..SIZE_OF_HEAP_HEADER + new_len]
             .copy_from_slice(&data[0..SIZE_OF_HEAP_HEADER]);
-        let mut htup = unsafe {
-            PgBox::<pg_sys::HeapTupleHeaderData, AllocatedByRust>::from_rust(
-                htup_vec.as_mut_ptr().cast::<pg_sys::HeapTupleHeaderData>(),
-            )
-        };
+        let mut htup =
+            unsafe { Box::from_raw(htup_vec.as_mut_ptr().cast::<pg_sys::HeapTupleHeaderData>()) };
         htup.t_infomask2 = xlhdr.t_infomask2;
         htup.t_infomask = xlhdr.t_infomask;
         htup.t_hoff = xlhdr.t_hoff;
@@ -396,10 +423,9 @@ impl WalDecoder {
         htup.t_infomask &= !u16::try_from(pg_sys::HEAP_COMBOCID).unwrap();
 
         unsafe {
-            let xlrec: PgBox<pg_sys::xl_heap_insert> = PgBox::from_pg(self.record.main_data.cast());
             if pg_sys::PageAddItemExtended(
                 page.as_ptr().cast::<i8>(),
-                htup.as_ptr().cast::<i8>(),
+                Box::into_raw(htup).cast(),
                 new_len,
                 xlrec.offnum,
                 (pg_sys::PAI_OVERWRITE | pg_sys::PAI_IS_HEAP)
@@ -410,5 +436,56 @@ impl WalDecoder {
                 panic!("failed to add tuple");
             }
         }
+    }
+
+    fn get_heap_rec_offnum(&self, old: bool) -> Option<pg_sys::OffsetNumber> {
+        let heap_op = self.get_heap_op();
+        match heap_op {
+            pg_sys::XLOG_HEAP_INSERT => {
+                if old {
+                    return None;
+                }
+                Some(self.get_xlrec::<pg_sys::xl_heap_insert>().offnum)
+            }
+            pg_sys::XLOG_HEAP_DELETE => {
+                if !old {
+                    return None;
+                }
+                Some(self.get_xlrec::<pg_sys::xl_heap_delete>().offnum)
+            }
+            pg_sys::XLOG_HEAP_HOT_UPDATE | pg_sys::XLOG_HEAP_UPDATE => {
+                let xlrec = self.get_xlrec::<pg_sys::xl_heap_update>();
+                if old {
+                    Some(xlrec.old_offnum)
+                } else {
+                    Some(xlrec.new_offnum)
+                }
+            }
+            e => panic!("Unknow heap op {e}"),
+        }
+    }
+
+    fn get_heap_tuple(
+        &self,
+        page: &PgBox<pg_sys::PageHeaderData>,
+        relid: pg_sys::Oid,
+        old: bool,
+    ) -> Option<PgBox<pg_sys::HeapTupleData>> {
+        let offnum = self.get_heap_rec_offnum(old)?;
+
+        let item_id = page::get_item_id(page, offnum.into());
+        let htuple = page::get_item(page, &item_id).cast();
+        let htup_len = item_id.lp_len();
+
+        let mut tuple = unsafe {
+            PgBox::<pg_sys::HeapTupleData>::from_pg(
+                pg_sys::palloc0(HEAP_TUPLE_SIZE + (htup_len as usize)).cast(),
+            )
+        };
+        tuple.t_data = htuple;
+        tuple.t_len = htup_len;
+        item::pointer_set_invalid(tuple.t_self);
+        tuple.t_tableOid = relid;
+        Some(tuple)
     }
 }

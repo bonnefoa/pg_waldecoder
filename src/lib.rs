@@ -7,6 +7,7 @@ mod wal;
 mod xlog_heap;
 mod xlog_reader;
 mod page;
+mod item;
 
 use pgrx::prelude::*;
 
@@ -28,10 +29,10 @@ fn pg_waldecoder(
         name!(dboid, pg_sys::Oid),
         name!(relid, pg_sys::Oid),
         name!(xid, pg_sys::TransactionId),
-        name!(redo_query, Option<&'static str>),
-        name!(revert_query, Option<&'static str>),
-        name!(row_before, Option<&'static str>),
-        name!(row_after, Option<&'static str>),
+        name!(redo_query, Option<String>),
+        name!(revert_query, Option<String>),
+        name!(row_before, Option<String>),
+        name!(row_after, Option<String>),
     ),
 > {
     info!("Called with: {start_lsn:?}, {end_lsn:?}, {timeline:?}, {wal_dir:?}");
@@ -99,9 +100,10 @@ mod tests {
 
         let wal_decoder = WalDecoder::new(startptr, None, 1, None);
         let results = wal_decoder.take(4).collect::<Vec<DecodedResult>>();
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 2);
         let decoded_record = &results[0];
         assert!(decoded_record.redo_query.is_some());
+        assert_eq!(decoded_record.redo_query.as_ref().unwrap(), "INSERT INTO test (id) VALUES (1)");
     }
 
 
